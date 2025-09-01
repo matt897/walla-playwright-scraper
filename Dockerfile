@@ -1,6 +1,6 @@
 # You can bump PLAYWRIGHT_TAG and PLAYWRIGHT_VERSION when needed
 ARG PLAYWRIGHT_TAG=1.55.0-jammy
-FROM mcr.microsoft.com/playwright:${PLAYWRIGHT_TAG}
+FROM mcr.microsoft.com/playwright:v${PLAYWRIGHT_TAG}
 
 # Keep the npm package in lockstep with the image’s browser bundle
 ARG PLAYWRIGHT_VERSION=1.55.0
