@@ -6,10 +6,10 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '1mb' }));
 
-// Allow /healthz without auth so Portainer healthchecks don’t need a key
+// Healthcheck: no auth so Portainer can probe
 app.get('/healthz', (_req, res) => res.send('ok'));
 
-// Simple auth for the rest
+// Simple auth for everything else
 app.use((req, res, next) => {
   const AUTH_TOKEN = process.env.SCRAPER_TOKEN || '';
   if (!AUTH_TOKEN) return next();
@@ -18,8 +18,8 @@ app.use((req, res, next) => {
   return res.status(401).json({ error: 'unauthorized' });
 });
 
-// Build the HTML w/out template literals (no ${} so compose doesn’t interpolate)
-const LOCAL_HTML = ({ start, end }) => (
+// Build the HTML without template literals (avoid ${} in compose)
+const LOCAL_HTML = ({ start, end }) =>
   '<!doctype html><html><head><meta charset="utf-8"/></head><body>'
   + '<div class="walla-widget-root" '
   + 'data-walla-id="3f4c5689-8468-47d5-a722-c0ab605b2da4" '
@@ -32,11 +32,10 @@ const LOCAL_HTML = ({ start, end }) => (
   + 'j=a.createElement(l); j.async=1; j.src=la; j.id="walla-widget-script";'
   + 's=a.getElementsByTagName(l)[0]||a.body; s.parentNode.insertBefore(j,s);'
   + '})(window,document,"script","https://widget.hellowalla.com/loader/v1/walla-widget-loader.js");</script>'
-  + '</body></html>'
-);
+  + '</body></html>';
 
 function normalize(list = []) {
-  return list.map(c => {
+  return list.map((c) => {
     const cap = Number(c.capacity ?? c.maxCapacity ?? 0);
     const booked = Number(c.booked ?? c.bookedCount ?? c.enrolled ?? 0);
     const open = Math.max(cap - booked, 0);
@@ -52,17 +51,27 @@ function normalize(list = []) {
       booked,
       open_spots: open,
       waitlist_count: Number(c.waitlist ?? c.waitlistCount ?? 0),
-      has_open_spots: open > 0
+      has_open_spots: open > 0,
     };
   });
 }
 
 app.get('/scrape-classes', async (req, res) => {
   const { start, end, url } = req.query;
+
   const browser = await chromium.launch({
-    args: ['--no-sandbox', '--disable-dev-shm-usage']
+    headless: true,
+    args: ['--no-sandbox', '--disable-dev-shm-usage'],
   });
-  const page = await browser.newPage();
+
+  // Playwright: set UA on the CONTEXT, not the page
+  const context = await browser.newContext({
+    userAgent:
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    viewport: { width: 1365, height: 900 },
+  });
+
+  const page = await context.newPage();
 
   let classesJson = null;
   const targetPath = '/api/classes';
@@ -75,36 +84,58 @@ app.get('/scrape-classes', async (req, res) => {
         const data = await r.json();
         if (Array.isArray(data)) classesJson = data;
       }
-    } catch {}
+    } catch {
+      /* ignore */
+    }
   });
 
   try {
     if (url) {
-      await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36');
-      await page.goto(String(url), { waitUntil: 'domcontentloaded' });
+      await page.goto(String(url), { waitUntil: 'domcontentloaded', timeout: 45000 });
     } else {
-      await page.setContent(LOCAL_HTML({ start, end }), { waitUntil: 'domcontentloaded' });
+      await page.setContent(LOCAL_HTML({ start, end }), {
+        waitUntil: 'domcontentloaded',
+        timeout: 45000,
+      });
     }
 
+    // Give the widget time to fetch; wait for the network call we care about
     try {
-      await page.waitForResponse((r) => r.url().includes(targetPath), { timeout: 30000 });
-    } catch {}
-    if (!classesJson) await page.waitForTimeout(2000);
-  } catch (e) {
-    await browser.close();
-    return res.status(500).json({ error: 'navigation_failed', details: String(e) });
-  }
+      await page.waitForResponse(
+        (r) => {
+          try {
+            return r.url().includes(targetPath);
+          } catch {
+            return false;
+          }
+        },
+        { timeout: 30000 }
+      );
+    } catch {
+      // fall through—sometimes the fetch happens fast or is cached
+    }
 
-  await browser.close();
-  const out = normalize(classesJson || []);
-  res.json({ start, end, count: out.length, classes: out });
+    if (!classesJson) {
+      // small grace period to allow any late responses
+      await page.waitForTimeout(2000);
+    }
+
+    const out = normalize(classesJson || []);
+    res.json({ start, end, count: out.length, classes: out });
+  } catch (e) {
+    res.status(500).json({ error: 'navigation_failed', details: String(e) });
+  } finally {
+    await context.close().catch(() => {});
+    await browser.close().catch(() => {});
+  }
 });
 
-// Helpful error handler so the process doesn’t die silently
+// Central error handler
 app.use((err, _req, res, _next) => {
   console.error('Unhandled error:', err);
-  if (res.headersSent) return;
-  res.status(500).json({ error: 'internal_error', details: String(err) });
+  if (!res.headersSent) {
+    res.status(500).json({ error: 'internal_error', details: String(err) });
+  }
 });
 
 const PORT = process.env.PORT || 8080;
