@@ -59,7 +59,7 @@ function normalize(list = []) {
 }
 
 // ---------- Summary helper (NY timezone) ----------
-function summarizeClassesNY(list = []) {
+function summarizeClassesNY(list = [], defaultDateISO = '') {
   const fmtDate = new Intl.DateTimeFormat('en-US', {
     timeZone: 'America/New_York',
     year: 'numeric',
@@ -73,10 +73,10 @@ function summarizeClassesNY(list = []) {
   });
 
   return list.map((c) => {
-    const d = c.start_time ? new Date(c.start_time) : null;
+    const d = c.start_time ? new Date(c.start_time) : (defaultDateISO ? new Date(defaultDateISO) : null);
     const mmddyyyy = d ? fmtDate.format(d) : '';
-    const date = mmddyyyy.replace(/^(\d{2})\/(\d{2})\/(\d{4})$/, '$3-$1-$2'); // -> YYYY-MM-DD
-    const time = d ? fmtTime.format(d) : '';
+    const date = mmddyyyy ? mmddyyyy.replace(/^(\d{2})\/(\d{2})\/(\d{4})$/, '$3-$1-$2') : (defaultDateISO || '');
+    const time = c.time || (d ? fmtTime.format(d) : '');
     return {
       date,          // "YYYY-MM-DD"
       time,          // "h:mm AM/PM"
@@ -125,15 +125,27 @@ async function withBrowser(fn) {
 // ---------- Utils ----------
 const toISODateStr = (v) => (v || '').toString().slice(0, 10);
 
+async function getWidgetFrame(page) {
+  const iframeEl = await page.waitForSelector('iframe[src*="widget.hellowalla.com"]', { timeout: 30000 });
+  const frame = await iframeEl.contentFrame();
+  return frame;
+}
+
 // ---------- Main endpoint: /scrape-classes ----------
 app.get('/scrape-classes', async (req, res) => {
-  const { start, end, url, debug } = req.query;
-  const format = String(req.query.format || 'json');       // 'json' | 'summary'
+  const {
+    start, end, url, debug,
+    mode,                // 'json' (default) | 'direct' | 'dom'
+    uuid: qUuid,         // optional override
+    locationId: qLoc,    // optional override
+  } = req.query;
+
+  const format   = String(req.query.format || 'json');   // 'json' | 'summary'
   const onlyOpen = String(req.query.onlyOpen || '0') === '1';
 
   const startISO = toISODateStr(start);
-  const endISO = toISODateStr(end);
-  const referer = String(url || 'https://www.pearlmovement.com/cityislandschedule');
+  const endISO   = toISODateStr(end);
+  const referer  = String(url || 'https://www.pearlmovement.com/cityislandschedule');
 
   const targetHost = 'widget.hellowalla.com';
   const targetPath = '/api/classes';
@@ -147,27 +159,7 @@ app.get('/scrape-classes', async (req, res) => {
         'Referer': referer,
       });
 
-      // capture ONLY the widget classes payload
-      let classesJson = null;
-      page.on('response', async (r) => {
-        try {
-          const u = new URL(r.url());
-          if (u.hostname !== targetHost) return;
-          if (!u.pathname.includes(targetPath)) return;
-
-          const ct = (r.headers()['content-type'] || '').toLowerCase();
-          if (!ct.includes('application/json')) return;
-
-          const data = await r.json();
-          classesJson = Array.isArray(data)
-            ? data
-            : Array.isArray(data?.data)
-            ? data.data
-            : null;
-        } catch { /* ignore */ }
-      });
-
-      // navigate to real page or local shell
+      // Navigate to real page or local shell
       if (url) {
         await page.goto(referer, { waitUntil: 'networkidle', timeout: 60000 });
       } else {
@@ -183,55 +175,166 @@ app.get('/scrape-classes', async (req, res) => {
         } catch { /* ignore */ }
       }
 
-      // wait for widget presence, then give network time
+      // Wait for widget presence
       try {
-        await page.waitForSelector(
-          'iframe[src*="hellowalla"], [data-walla-page="classes"]',
-          { timeout: 20000 }
-        );
+        await page.waitForSelector('iframe[src*="hellowalla"], [data-walla-page="classes"]', { timeout: 20000 });
       } catch { /* ignore */ }
 
+      // ---------- MODE: DOM (read badges from rendered UI) ----------
+      if (mode === 'dom') {
+        const frame = await getWidgetFrame(page);
+        // Extract rows that contain "SPOT/ SPOTS" badges
+        const rows = await frame.evaluate((defaultDate) => {
+          const out = [];
+          const q = (sel, root=document) => Array.from(root.querySelectorAll(sel));
+          const getText = (el) => (el?.innerText || '').trim();
+
+          // Find any element whose text looks like "2 SPOTS" or "1 SPOT" or "0 SPOTS"
+          const badgeEls = q('span,div').filter(el => /\b\d+\s*SPOTS?\b/i.test(getText(el)));
+
+          for (const badge of badgeEls) {
+            const badgeText = getText(badge);
+            const m = badgeText.match(/(\d+)\s*SPOTS?/i);
+            const open = m ? parseInt(m[1], 10) : 0;
+
+            // Move up to a probable "row"
+            const row =
+              badge.closest('[data-testid="class-row"], .class-row, .schedule-row, li, tr, .row, .class-item, .list-item') ||
+              badge.parentElement;
+
+            const rowText = getText(row);
+            // Time: e.g., "8:15 AM" / "5:45 PM"
+            const tm = rowText.match(/\b([0-1]?\d:[0-5]\d)\s*([AP]M)\b/i);
+            const time = tm ? (tm[1] + ' ' + tm[2].toUpperCase()) : '';
+
+            // Class name: guess common selectors; fallback to first non-empty link/header
+            const nameEl = row.querySelector('a, .class-title, [data-testid="class-name"], h3, h4');
+            let class_name = getText(nameEl);
+            if (!class_name) {
+              // try first link text in the row
+              const a = row.querySelector('a');
+              class_name = getText(a) || (rowText.split('\n').map(s => s.trim()).filter(Boolean)[0] || '');
+            }
+
+            // Instructor: look for "w/ NAME" pattern or a label near the title
+            let instructor = '';
+            const im = rowText.match(/w\/\s*([A-Za-z][A-Za-z .'-]+)/i);
+            if (im) instructor = im[1];
+
+            out.push({
+              class_name,
+              instructor,
+              // For DOM mode we attach date/time fields directly
+              date: defaultDate || '',
+              time,
+              open_spots: open,
+              has_open_spots: open > 0,
+              start_time: null, // unknown from DOM-only read
+              end_time: null,
+            });
+          }
+
+          // Deduplicate by (time + class_name)
+          const seen = new Set();
+          const dedup = [];
+          for (const r of out) {
+            const key = `${r.date}|${r.time}|${r.class_name}`;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            dedup.push(r);
+          }
+          return dedup;
+        }, startISO);
+
+        // Shape DOM results to share the same keys as normalize() where possible
+        const shaped = rows.map(r => ({
+          class_id: null,
+          class_name: r.class_name,
+          instructor: r.instructor,
+          start_time: r.start_time,  // null (DOM didn’t give ISO)
+          end_time: r.end_time,      // null
+          room: '',
+          location_id: 3589,
+          capacity: null,
+          booked: null,
+          open_spots: r.open_spots,
+          waitlist_count: null,
+          has_open_spots: r.has_open_spots,
+          // carry date/time for summary formatting
+          date: r.date,
+          time: r.time,
+        }));
+
+        return { classes: shaped, mode: 'dom' };
+      }
+
+      // ---------- MODE: JSON (listen for /api/classes) ----------
+      let classesJson = null;
+
+      page.on('response', async (r) => {
+        try {
+          const u = new URL(r.url());
+          if (u.hostname !== targetHost) return;
+          if (!u.pathname.includes(targetPath)) return;
+
+          const ct = (r.headers()['content-type'] || '').toLowerCase();
+          if (!ct.includes('application/json')) return;
+
+          const data = await r.json();
+          classesJson = Array.isArray(data)
+            ? data
+            : Array.isArray(data?.data)
+              ? data.data
+              : null;
+        } catch { /* ignore */ }
+      });
+
+      // Give the network listener time to catch the JSON
       await page.waitForTimeout(3000);
       if (!classesJson) await page.waitForTimeout(4000);
 
-      // ----- Direct-API fallback (derive uuid/locationId from DOM or env) -----
-      async function directFetchFromDom() {
-        const meta = await page.evaluate(() => {
-          const out = {};
-          const nodes = Array.from(document.querySelectorAll('script[src],iframe[src]'));
-          for (const el of nodes) {
-            const s = el.getAttribute('src');
-            if (!s || !s.includes('widget.hellowalla.com')) continue;
-            try {
-              const u = new URL(s, location.href);
-              for (const [k, v] of u.searchParams.entries()) {
-                if (!out.uuid && /uuid/i.test(k)) out.uuid = v;
-                if (!out.locationId && /locationid/i.test(k)) out.locationId = v;
-                if (!out.start && /start/i.test(k)) out.start = v;
-                if (!out.end && /end/i.test(k)) out.end = v;
-              }
-            } catch {}
-          }
-          const root = document.querySelector('[data-walla-id],[data-walla-locationid]');
-          if (root) {
-            if (!out.uuid) out.uuid = root.getAttribute('data-walla-id') || out.uuid;
-            if (!out.locationId) out.locationId = root.getAttribute('data-walla-locationid') || out.locationId;
-            if (!out.start) out.start = root.getAttribute('data-start') || out.start;
-            if (!out.end) out.end = root.getAttribute('data-end') || out.end;
-          }
-          return out;
-        });
+      // ---------- MODE: DIRECT (or fallback for JSON mode) ----------
+      async function directFetch(uuidOverride, locOverride) {
+        let uuid = uuidOverride || process.env.WALLA_UUID || '';
+        let locationId = locOverride || process.env.WALLA_LOCATION_ID || '';
 
-        const uuid = meta.uuid || process.env.WALLA_UUID || '';
-        const locationId = meta.locationId || process.env.WALLA_LOCATION_ID || '';
-        const s = startISO || meta.start || '';
-        const e = endISO || meta.end || '';
+        // If still missing, try to discover from DOM
+        if (!uuid || !locationId) {
+          const meta = await page.evaluate(() => {
+            const out = {};
+            const nodes = Array.from(document.querySelectorAll('script[src],iframe[src]'));
+            for (const el of nodes) {
+              const s = el.getAttribute('src');
+              if (!s || !s.includes('widget.hellowalla.com')) continue;
+              try {
+                const u = new URL(s, location.href);
+                for (const [k, v] of u.searchParams.entries()) {
+                  if (!out.uuid && /uuid/i.test(k)) out.uuid = v;
+                  if (!out.locationId && /locationid/i.test(k)) out.locationId = v;
+                  if (!out.start && /start/i.test(k)) out.start = v;
+                  if (!out.end && /end/i.test(k)) out.end = v;
+                }
+              } catch {}
+            }
+            const root = document.querySelector('[data-walla-id],[data-walla-locationid]');
+            if (root) {
+              if (!out.uuid) out.uuid = root.getAttribute('data-walla-id') || out.uuid;
+              if (!out.locationId) out.locationId = root.getAttribute('data-walla-locationid') || out.locationId;
+              if (!out.start) out.start = root.getAttribute('data-start') || out.start;
+              if (!out.end) out.end = root.getAttribute('data-end') || out.end;
+            }
+            return out;
+          });
+          uuid      = uuid      || meta.uuid || '';
+          locationId= locationId|| meta.locationId || '';
+        }
 
+        const s = startISO || '';
+        const e = endISO   || '';
         if (!uuid || !locationId) return null;
 
         const apiUrl =
-          `https://${targetHost}${targetPath}?` +
-          `uuid=${encodeURIComponent(uuid)}&locationId=${encodeURIComponent(locationId)}` +
+          `https://${targetHost}${targetPath}?uuid=${encodeURIComponent(uuid)}&locationId=${encodeURIComponent(locationId)}` +
           (s ? `&start=${encodeURIComponent(s)}` : '') +
           (e ? `&end=${encodeURIComponent(e)}` : '');
 
@@ -250,40 +353,40 @@ app.get('/scrape-classes', async (req, res) => {
         return Array.isArray(data) ? data : (Array.isArray(data?.data) ? data.data : null);
       }
 
-      if (!classesJson) {
-        try { classesJson = await directFetchFromDom(); } catch { /* ignore */ }
+      if (mode === 'direct' || (!classesJson)) {
+        try { classesJson = await directFetch(qUuid, qLoc); } catch { /* ignore */ }
       }
 
       // Optional debug snapshot when still empty
       if ((!classesJson || !Array.isArray(classesJson)) && debug) {
         const title = (await page.title().catch(() => '')) || '';
-        const html = (await page.content().catch(() => '')) || '';
+        const html  = (await page.content().catch(() => '')) || '';
         return { debug: { title, sample: html.slice(0, 2000) }, classes: [] };
       }
 
-      return { classes: normalize(classesJson || []) };
+      return { classes: normalize(classesJson || []), mode: mode || 'json' };
     });
 
-    // ---------- ALWAYS return an array (this is the important safety fix) ----------
+    // ---------- ALWAYS return an array (safety) ----------
     let rows = Array.isArray(result.classes) ? result.classes : [];
 
-    // Filtering & formatting options
     if (onlyOpen) rows = rows.filter((r) => (r.open_spots || 0) > 0);
 
     if (result.debug) {
-      // When debugging, still keep classes as an array
       return res.json({
         start: startISO,
         end: endISO,
         count: 0,
         classes: [],
         debug: result.debug,
+        mode: result.mode || 'json',
       });
     }
 
     if (format === 'summary') {
-      const summary = summarizeClassesNY(rows);
-      return res.json({ count: summary.length, classes: summary });
+      // In DOM mode, we already filled date/time; use startISO as default date
+      const summary = summarizeClassesNY(rows, startISO);
+      return res.json({ count: summary.length, classes: summary, mode: result.mode || 'json' });
     }
 
     // default: full JSON
@@ -292,6 +395,7 @@ app.get('/scrape-classes', async (req, res) => {
       end: endISO,
       count: rows.length,
       classes: rows,
+      mode: result.mode || 'json',
     });
 
   } catch (e) {
