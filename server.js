@@ -6,8 +6,10 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '1mb' }));
 
+// Health check (no auth)
 app.get('/healthz', (_req, res) => res.send('ok'));
 
+// Auth (optional via SCRAPER_TOKEN env)
 app.use((req, res, next) => {
   const AUTH_TOKEN = process.env.SCRAPER_TOKEN || '';
   if (!AUTH_TOKEN) return next();
@@ -16,7 +18,7 @@ app.use((req, res, next) => {
   return res.status(401).json({ error: 'unauthorized' });
 });
 
-// No template literals so compose doesn't interpolate
+// Build the widget HTML (avoid ${} so compose won't interpolate)
 const LOCAL_HTML = ({ start, end }) => (
   '<!doctype html><html><head><meta charset="utf-8"/></head><body>'
   + '<div class="walla-widget-root" '
@@ -33,105 +35,125 @@ const LOCAL_HTML = ({ start, end }) => (
   + '</body></html>'
 );
 
-function coerceArray(payload) {
-  if (Array.isArray(payload)) return payload;
-  if (payload && typeof payload === 'object') {
-    if (Array.isArray(payload.classes)) return payload.classes;
-    if (Array.isArray(payload.data)) return payload.data;
-    if (Array.isArray(payload.results)) return payload.results;
-  }
-  return null;
-}
-
+// Normalize to a stable JSON shape
 function normalize(list = []) {
   return list.map(c => {
-    const cap = Number(c?.capacity ?? c?.maxCapacity ?? 0);
-    const booked = Number(c?.booked ?? c?.bookedCount ?? c?.enrolled ?? 0);
+    const cap = Number(c.capacity ?? c.maxCapacity ?? 0);
+    const booked = Number(c.booked ?? c.bookedCount ?? c.enrolled ?? 0);
     const open = Math.max(cap - booked, 0);
     return {
-      class_id: c?.id ?? c?.classId ?? null,
-      class_name: c?.name ?? c?.className ?? '',
-      instructor: (c?.instructor && (c.instructor.name || c.instructor)) || '',
-      start_time: c?.start ?? c?.startTime ?? null,
-      end_time: c?.end ?? c?.endTime ?? null,
-      room: c?.room ?? c?.roomName ?? '',
-      location_id: c?.locationId ?? 3589,
+      class_id: c.id ?? c.classId ?? null,
+      class_name: c.name ?? c.className ?? '',
+      instructor: (c && c.instructor && (c.instructor.name ?? c.instructor)) ?? '',
+      start_time: c.start ?? c.startTime ?? null,
+      end_time: c.end ?? c.endTime ?? null,
+      room: c.room ?? c.roomName ?? '',
+      location_id: c.locationId ?? 3589,
       capacity: cap,
       booked,
       open_spots: open,
-      waitlist_count: Number(c?.waitlist ?? c?.waitlistCount ?? 0),
-      has_open_spots: open > 0
+      waitlist_count: Number(c.waitlist ?? c.waitlistCount ?? 0),
+      has_open_spots: open > 0,
     };
   });
 }
 
 app.get('/scrape-classes', async (req, res) => {
-  const { start, end, url, debug } = req.query;
+  const { start, end, url, force } = req.query;
 
-  const browser = await chromium.launch({
-    headless: true,
-    args: ['--no-sandbox', '--disable-dev-shm-usage']
-  });
-  const page = await browser.newPage();
+  let browser;
+  let context;
+  let page;
 
-  // Capture useful debug info
-  const seenUrls = [];
-  page.on('request', r => { try { seenUrls.push(r.url()); } catch {} });
-
+  // Collect JSON from the widget’s XHR/fetch
   let classesJson = null;
-
-  // Be flexible: catch any network response whose URL contains 'classes' or 'schedule'
-  page.on('response', async (r) => {
-    try {
-      const u = new URL(r.url());
-      const ct = (r.headers()['content-type'] || '').toLowerCase();
-      if ((u.pathname.includes('classes') || u.pathname.includes('schedule')) && ct.includes('application/json')) {
-        const data = await r.json();
-        const arr = coerceArray(data);
-        if (arr) classesJson = arr;
-      }
-    } catch { /* ignore */ }
-  });
+  const targetPath = '/api/classes';
+  const userAgent =
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+    '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
   try {
-    if (url) {
-      await page.goto(String(url), { waitUntil: 'domcontentloaded', timeout: 60000 });
+    browser = await chromium.launch({
+      headless: true,
+      args: ['--no-sandbox', '--disable-dev-shm-usage'],
+    });
+
+    context = await browser.newContext({ userAgent, locale: 'en-US' });
+    page = await context.newPage();
+
+    // Extra safety: if the page crashes, fail quickly with a clear error
+    let crashed = false;
+    page.on('crash', () => (crashed = true));
+    page.on('close', () => (crashed = true));
+
+    page.on('response', async (r) => {
+      try {
+        const ct = (r.headers()['content-type'] || '').toLowerCase();
+        if (!ct.includes('application/json')) return;
+        const u = new URL(r.url());
+        if (u.pathname.includes(targetPath)) {
+          const data = await r.json();
+          if (Array.isArray(data)) classesJson = data;
+        }
+      } catch {
+        // swallow parse errors
+      }
+    });
+
+    const useLocal = String(force || '').toLowerCase() === 'local' || !url;
+
+    if (useLocal) {
+      await page.setContent(LOCAL_HTML({ start, end }), { waitUntil: 'load', timeout: 45000 });
     } else {
-      await page.setContent(LOCAL_HTML({ start, end }), { waitUntil: 'domcontentloaded', timeout: 60000 });
+      await page.goto(String(url), { waitUntil: 'domcontentloaded', timeout: 45000 });
     }
 
-    // Wait for either the JSON fetch or a likely widget element
-    const waiters = [
-      page.waitForResponse(r => {
-        try { return r.url().includes('classes') || r.url().includes('schedule'); } catch { return false; }
-      }, { timeout: 30000 }).catch(() => null),
-      page.waitForSelector('.walla-widget-root, [data-walla-id]', { timeout: 15000 }).catch(() => null)
-    ];
-    await Promise.race(waiters);
+    // Wait up to 45s for the API hit; then give the widget a little time
+    try {
+      await page.waitForResponse(
+        (r) => {
+          try {
+            return new URL(r.url()).pathname.includes(targetPath);
+          } catch {
+            return false;
+          }
+        },
+        { timeout: 45000 }
+      );
+    } catch {
+      // it's okay if we timed out waiting; we'll still check classesJson
+    }
 
-    // Give some extra time for the widget to finish loading
-    if (!classesJson) await page.waitForTimeout(3000);
+    if (!classesJson && !crashed) {
+      // small grace period for late responses
+      await page.waitForTimeout(2000);
+    }
+
+    if (crashed) {
+      throw new Error('page_crashed');
+    }
+
+    const out = normalize(classesJson || []);
+    return res.json({ start, end, count: out.length, classes: out });
   } catch (e) {
-    await browser.close();
-    return res.status(500).json({ error: 'navigation_failed', details: String(e) });
-  }
-
-  const html = debug ? await page.content().catch(() => '') : '';
-  await browser.close();
-
-  const out = normalize(classesJson || []);
-  if (debug) {
-    return res.json({
-      start, end,
-      count: out.length,
-      sampleUrls: seenUrls.slice(-20),   // last 20 URLs
-      htmlPreview: html.slice(0, 2000),  // first 2KB so response stays small
-      classes: out
+    return res.status(500).json({
+      error: 'navigation_failed',
+      details: String(e && e.message ? e.message : e),
     });
+  } finally {
+    try {
+      if (page) await page.close({ runBeforeUnload: false });
+    } catch {}
+    try {
+      if (context) await context.close();
+    } catch {}
+    try {
+      if (browser) await browser.close();
+    } catch {}
   }
-  return res.json({ start, end, count: out.length, classes: out });
 });
 
+// Global error guard
 app.use((err, _req, res, _next) => {
   console.error('Unhandled error:', err);
   if (res.headersSent) return;
