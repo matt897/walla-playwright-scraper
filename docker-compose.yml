@@ -1,0 +1,21 @@
+services:
+  walla-scraper:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        PLAYWRIGHT_TAG: ${PLAYWRIGHT_TAG:-1.55.0-jammy}
+        PLAYWRIGHT_VERSION: ${PLAYWRIGHT_VERSION:-1.55.0}
+    environment:
+      PORT: 8080
+      SCRAPER_TOKEN: ${SCRAPER_TOKEN:-}     # set in Portainer for auth
+    ports:
+      - "8080:8080"
+    shm_size: "1g"                          # avoid Chromium /dev/shm crashes
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
