@@ -165,7 +165,7 @@ app.get('/capture-schedule', async (req, res) => {
   }
 });
 
-// ---------- Text + structured rows (locks to requested day section) ----------
+// ---------- Text + structured rows (locks to requested day; has global fallback) ----------
 // GET /capture-schedule-text?start=YYYY-MM-DD&end=YYYY-MM-DD[&url=...][&debug=1]
 app.get('/capture-schedule-text', async (req, res) => {
   const startISO = toISO(req.query.start);
@@ -211,18 +211,16 @@ app.get('/capture-schedule-text', async (req, res) => {
       await frame.evaluate((iso) => {
         const d = new Date(iso + 'T12:00:00');
         const dowShort = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][d.getUTCDay()];
-        const dowLong  = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'][d.getUTCDay()];
         const monShort = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][d.getUTCMonth()];
         const day      = d.getUTCDate();
-
         const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
 
-        // Try "Daily"
+        // Click "Daily" if present
         const dailyBtn = Array.from(document.querySelectorAll('button,[role=tab],a,[role=button]'))
           .find(el => /^daily$/i.test(norm(el.innerText || el.textContent || '')));
         if (dailyBtn) dailyBtn.dispatchEvent(new MouseEvent('click', { bubbles: true }));
 
-        // Try clicking the target day tab (several label variants)
+        // Click the desired day tab if present
         const tabVariants = new Set([
           `${dowShort} ${monShort} ${day}`, // "Wed Sep 3"
           `${monShort} ${day}`,             // "Sep 3"
@@ -246,9 +244,11 @@ app.get('/capture-schedule-text', async (req, res) => {
       // 5) Text snapshot (debugging)
       const text = await frame.evaluate(() => document.body.innerText || '').catch(() => '');
 
-      // 6) Parse ONLY the requested day's section
-      const rows = await frame.evaluate((iso) => {
-        const out = [];
+      // 6) Parse: day-section first, then global fallback if needed
+      const { rows, mode } = await frame.evaluate((iso) => {
+        const outRows = [];
+        let mode = 'day-section';
+
         const qAll = (sel, root = document) => Array.from(root.querySelectorAll(sel));
         const txt  = (el) => (el?.innerText || '').trim();
         const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
@@ -260,33 +260,12 @@ app.get('/capture-schedule-text', async (req, res) => {
         const wantUpper = `${dowLong.toUpperCase()}, ${monLong.toUpperCase()} ${d.getUTCDate()}`;
         const wantCap   = `${dowLong}, ${monLong} ${d.getUTCDate()}`;
 
-        // Find the header element for the requested day
-        const headers = qAll('h1,h2,h3,h4,[role=heading],.date-header,.day-header,.schedule-day-header');
-        let headerEl = headers.find(el => {
-          const t = norm(txt(el));
-          return t.includes(wantUpper) || t.includes(wantCap);
-        });
-        if (!headerEl) headerEl = headers[0];
-        if (!headerEl) return out;
-
-        // Collect nodes after headerEl until the next header
-        const dayChunks = [];
-        let cur = headerEl.nextElementSibling;
-        while (cur) {
-          const t = norm(txt(cur));
-          const isAnotherHeader =
-            /^(SUNDAY|MONDAY|TUESDAY|WEDNESDAY|THURSDAY|FRIDAY|SATURDAY),\s+[A-Z]+\s+\d{1,2}$/.test(t) ||
-            /^[A-Z][a-z]+,\s+[A-Z][a-z]+\s+\d{1,2}$/.test(t);
-          if (isAnotherHeader) break;
-          dayChunks.push(cur);
-          cur = cur.nextElementSibling;
-        }
-
+        // Regex helpers
         const TIME_RE  = /\b([0-1]?\d:[0-5]\d)\s*([AP]M)\b/i;
         const SPOTS_RE = /\b(\d+)\s*SPOTS?\b/i;
         const IGNORE_NAME_RE = /^(EDT|[\d]+\s*min|In-?Person|Book|map|Log In|Daily|Weekly|List|Filter by|Type|Location|Instructor|Name|Category|All|The Pearl(?: Pilates Haven)?|Drop-in:|\$[\d.,]+|TIME\s+CLASS)$/i;
 
-        function isCandidateName(s) {
+        const isCandidateName = (s) => {
           if (!s || s.length < 3) return false;
           if (TIME_RE.test(s)) return false;
           if (IGNORE_NAME_RE.test(s)) return false;
@@ -294,89 +273,122 @@ app.get('/capture-schedule-text', async (req, res) => {
           if (/^Sold\s*Out$/i.test(s)) return false;
           if (/^Full$/i.test(s)) return false;
           return true;
+        };
+
+        function parseCandidates(cands) {
+          const rows = [];
+          for (const row of cands) {
+            const rowText = txt(row);
+            const tm = rowText.match(TIME_RE);
+            const time = tm ? `${tm[1]} ${tm[2].toUpperCase()}` : '';
+            if (!time) continue;
+
+            let class_name = '';
+            const nameEl = row.querySelector('a, .class-title, [data-testid="class-name"], h3, h4, [role="heading"]');
+            if (nameEl) class_name = txt(nameEl);
+            if (!class_name) {
+              const parts = rowText.split('\n').map(s => s.trim()).filter(Boolean);
+              for (const p of parts) { if (isCandidateName(p)) { class_name = p; break; } }
+            }
+
+            let instructor = '';
+            const im = rowText.match(/w\/\s*([A-Za-z][A-Za-z .'-]+)/i);
+            if (im) instructor = im[1].trim();
+
+            const badges = qAll('span, div, button', row).map(txt);
+            const spotsLabel = badges.find(t => SPOTS_RE.test(t));
+            const btnText    = badges.find(t => /book|waitlist|sold\s*out|full/i.test(t)) || '';
+
+            let open_spots = null;
+            let status = 'unknown';
+
+            if (spotsLabel) {
+              const m = spotsLabel.match(SPOTS_RE);
+              open_spots = m ? parseInt(m[1], 10) : 0;
+              status = open_spots > 0 ? 'open' : 'full';
+            }
+            if (/waitlist/i.test(btnText) || /waitlist/i.test(rowText)) {
+              status = 'waitlist';
+              if (open_spots === null) open_spots = 0;
+            } else if (/sold\s*out|^full$/i.test(btnText)) {
+              status = 'full';
+              if (open_spots === null) open_spots = 0;
+            } else if (/book/i.test(btnText) && open_spots === null) {
+              status = 'open';
+              open_spots = null; // unknown count
+            }
+
+            if (time && (class_name || status !== 'unknown')) {
+              rows.push({
+                date: iso || '',
+                time,
+                class_name: class_name || '',
+                instructor: instructor || '',
+                status,
+                open_spots,
+              });
+            }
+          }
+          // Dedup
+          const seen = new Set();
+          const dedup = [];
+          for (const r of rows) {
+            const key = `${r.date}|${r.time}|${r.class_name}`;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            dedup.push(r);
+          }
+          return dedup;
         }
 
-        const candidates = [];
-        for (const sect of dayChunks) {
-          candidates.push(...qAll('[data-testid="class-row"], .class-row, .schedule-row, .class-item, li, tr, .row', sect));
-        }
-        if (candidates.length === 0) {
-          for (const sect of dayChunks) candidates.push(sect);
-        }
+        // ---- Try DAY-SECTION parse ----
+        const headers = Array.from(document.querySelectorAll('h1,h2,h3,h4,[role=heading],.date-header,.day-header,.schedule-day-header'));
+        let headerEl = headers.find(el => {
+          const t = norm(txt(el));
+          return t.includes(wantUpper) || t.includes(wantCap);
+        }) || headers[0];
 
-        for (const row of candidates) {
-          const rowText = txt(row);
-          const tm = rowText.match(TIME_RE);
-          const time = tm ? `${tm[1]} ${tm[2].toUpperCase()}` : '';
-          if (!time) continue;
-
-          // Class name
-          let class_name = '';
-          const nameEl = row.querySelector('a, .class-title, [data-testid="class-name"], h3, h4, [role="heading"]');
-          if (nameEl) class_name = txt(nameEl);
-          if (!class_name) {
-            const parts = rowText.split('\n').map(s => s.trim()).filter(Boolean);
-            for (const p of parts) { if (isCandidateName(p)) { class_name = p; break; } }
+        if (headerEl) {
+          const dayChunks = [];
+          let cur = headerEl.nextElementSibling;
+          while (cur) {
+            const t = norm(txt(cur));
+            const isAnotherHeader =
+              /^(SUNDAY|MONDAY|TUESDAY|WEDNESDAY|THURSDAY|FRIDAY|SATURDAY),\s+[A-Z]+\s+\d{1,2}$/.test(t) ||
+              /^[A-Z][a-z]+,\s+[A-Z][a-z]+\s+\d{1,2}$/.test(t);
+            if (isAnotherHeader) break;
+            dayChunks.push(cur);
+            cur = cur.nextElementSibling;
           }
 
-          // Instructor (e.g., "w/ Ana Maria")
-          let instructor = '';
-          const im = rowText.match(/w\/\s*([A-Za-z][A-Za-z .'-]+)/i);
-          if (im) instructor = im[1].trim();
-
-          // Spots badge or button text
-          const badges = qAll('span, div, button', row).map(txt);
-          const spotsLabel = badges.find(t => SPOTS_RE.test(t));
-          const btnText    = badges.find(t => /book|waitlist|sold\s*out|full/i.test(t)) || '';
-
-          let open_spots = null;
-          let status = 'unknown';
-
-          if (spotsLabel) {
-            const m = spotsLabel.match(SPOTS_RE);
-            open_spots = m ? parseInt(m[1], 10) : 0;
-            status = open_spots > 0 ? 'open' : 'full';
+          let candidates = [];
+          for (const sect of dayChunks) {
+            candidates.push(...(sect.querySelectorAll
+              ? Array.from(sect.querySelectorAll('[data-testid="class-row"], .class-row, .schedule-row, .class-item, li, tr, .row'))
+              : []));
           }
-          if (/waitlist/i.test(btnText) || /waitlist/i.test(rowText)) {
-            status = 'waitlist';
-            if (open_spots === null) open_spots = 0;
-          } else if (/sold\s*out|^full$/i.test(btnText)) {
-            status = 'full';
-            if (open_spots === null) open_spots = 0;
-          } else if (/book/i.test(btnText) && open_spots === null) {
-            // "Book" without numeric badge -> open but unknown count
-            status = 'open';
-            open_spots = null;
+          if (candidates.length === 0) {
+            for (const sect of dayChunks) candidates.push(sect);
           }
 
-          if (time && (class_name || status !== 'unknown')) {
-            out.push({
-              date: iso || '',
-              time,
-              class_name: class_name || '',
-              instructor: instructor || '',
-              status,
-              open_spots, // number | null
-            });
+          const parsed = parseCandidates(candidates);
+          if (parsed.length > 0) {
+            return { rows: parsed, mode };
           }
         }
 
-        // Deduplicate
-        const seen = new Set();
-        const dedup = [];
-        for (const r of out) {
-          const key = `${r.date}|${r.time}|${r.class_name}`;
-          if (seen.has(key)) continue;
-          seen.add(key);
-          dedup.push(r);
-        }
-        return dedup;
-      }, startISO).catch(() => []);
+        // ---- GLOBAL FALLBACK (no header or empty section) ----
+        mode = 'global-fallback';
+        const globalCandidates = Array.from(document.querySelectorAll('[data-testid="class-row"], .class-row, .schedule-row, .class-item, li, tr, .row'))
+          .filter(el => (el && (el.innerText || '').trim().length > 0));
+        const parsedAll = parseCandidates(globalCandidates);
+        return { rows: parsedAll, mode };
+      }, startISO);
 
       // Also report frame URLs for quick debugging
       const frames = page.frames().map(fr => fr.url());
 
-      return { text, parsed: rows, frames };
+      return { text, parsed: rows.rows, parse_mode: rows.mode, frames };
     });
 
     return res.json({ start: startISO, end: endISO, ...out });
