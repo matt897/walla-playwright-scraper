@@ -1,158 +1,3 @@
-// server.js
-// Run with Node 18+ (for global fetch). Install Playwright browsers once:
-//   npx playwright install --with-deps
-
-import express from 'express';
-import cors from 'cors';
-import { chromium, devices } from 'playwright';
-
-const app = express();
-app.use(cors());
-app.use(express.json({ limit: '1mb' }));
-
-// ---------- Health ----------
-app.get('/healthz', (_req, res) => res.send('ok'));
-
-// ---------- Auth (x-api-key or ?key=...) ----------
-app.use((req, res, next) => {
-  const AUTH_TOKEN = process.env.SCRAPER_TOKEN || '';
-  if (!AUTH_TOKEN) return next();
-  const token = req.get('x-api-key') || req.query.key;
-  if (token === AUTH_TOKEN) return next();
-  return res.status(401).json({ error: 'unauthorized' });
-});
-
-// ---------- Configurable widget identity (envs optional) ----------
-const WALLA_UUID = process.env.WALLA_UUID || '3f4c5689-8468-47d5-a722-c0ab605b2da4';
-const WALLA_LOCATION_ID = process.env.WALLA_LOCATION_ID || '3589';
-
-// ---------- Local HTML shell for the widget ----------
-const LOCAL_HTML = ({ start, end }) =>
-  '<!doctype html><html><head><meta charset="utf-8"/></head><body>' +
-  '<div class="walla-widget-root" ' +
-  `data-walla-id="${WALLA_UUID}" ` +
-  'data-walla-page="classes" ' +
-  `data-walla-locationid="${WALLA_LOCATION_ID}" ` +
-  `data-start="${start || ''}" data-end="${end || ''}"></div>` +
-  '<script>(function(w,a,l,la,j,s){' +
-  'const t=a.getElementById("walla-widget-script"); if(t) return;' +
-  'j=a.createElement(l); j.async=1; j.src=la; j.id="walla-widget-script";' +
-  's=a.getElementsByTagName(l)[0]||a.body; s.parentNode.insertBefore(j,s);' +
-  '})(window,document,"script","https://widget.hellowalla.com/loader/v1/walla-widget-loader.js");</script>' +
-  '</body></html>';
-
-// ---------- Playwright launcher ----------
-async function withBrowser(fn, { dpr = 2 } = {}) {
-  const browser = await chromium.launch({
-    headless: true,
-    args: [
-      '--no-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-web-security',
-      '--disable-features=IsolateOrigins,site-per-process',
-    ],
-  });
-
-  try {
-    const context = await browser.newContext({
-      ...devices['Desktop Chrome'],
-      deviceScaleFactor: Math.max(1, Math.min(4, Number(dpr) || 2)),
-      ignoreHTTPSErrors: true,
-      locale: 'en-US',
-      timezoneId: 'America/New_York',
-      userAgent:
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
-        '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-    });
-    context.setDefaultNavigationTimeout(120000);
-    context.setDefaultTimeout(90000);
-
-    await context.addInitScript(() => {
-      Object.defineProperty(navigator, 'webdriver', { get: () => false });
-    });
-
-    const page = await context.newPage();
-    await page.setViewportSize({ width: 1360, height: 1800 });
-    return await fn({ browser, context, page });
-  } finally {
-    await browser.close();
-  }
-}
-
-const toISO = (v) => (v || '').toString().slice(0, 10);
-
-async function getWidgetFrame(page) {
-  const iframeEl = await page.waitForSelector('iframe[src*="widget.hellowalla.com"]', { timeout: 45000 });
-  const frame = await iframeEl.contentFrame();
-  if (!frame) throw new Error('widget_frame_not_ready');
-  return frame;
-}
-
-// ---------- Route: capture PNG of the widget ----------
-// GET /capture-schedule?start=YYYY-MM-DD&end=YYYY-MM-DD[&url=...][&dpr=2][&delay=1500][&fullPage=0]
-app.get('/capture-schedule', async (req, res) => {
-  const startISO = toISO(req.query.start);
-  const endISO   = toISO(req.query.end);
-  const dpr      = Number(req.query.dpr || 2);
-  const delayMs  = Number(req.query.delay || 1500);
-  const fullPage = String(req.query.fullPage || '0') === '1';
-  const referer  = String(req.query.url || '');
-
-  try {
-    const pngBuffer = await withBrowser(async ({ page }) => {
-      // Block common trackers that keep connections open
-      await page.route('**/*', route => {
-        const u = route.request().url();
-        if (/\b(googletagmanager|google-analytics|doubleclick|hotjar|facebook|segment|sentry|intercom|hs-scripts)\b/i.test(u)) {
-          return route.abort();
-        }
-        route.continue();
-      });
-
-      if (referer) {
-        await page.goto(referer, { waitUntil: 'domcontentloaded', timeout: 120000 });
-        await page.waitForLoadState('load', { timeout: 15000 }).catch(() => {});
-      } else {
-        await page.setContent(LOCAL_HTML({ start: startISO, end: endISO }), {
-          waitUntil: 'domcontentloaded',
-          timeout: 60000,
-        });
-      }
-
-      const frame = await getWidgetFrame(page);
-
-      // Scroll through the frame to trigger any lazy loads
-      await frame.evaluate(async () => {
-        const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-        for (let i = 0; i < 6; i++) {
-          window.scrollTo(0, document.body.scrollHeight);
-          await sleep(250);
-        }
-        window.scrollTo(0, 0);
-      });
-
-      await page.waitForTimeout(delayMs);
-
-      if (fullPage) {
-        return await page.screenshot({ type: 'png', fullPage: true });
-      } else {
-        return await frame.locator('body').screenshot({ type: 'png' });
-      }
-    }, { dpr });
-
-    // no caching anywhere; delivered inline; nothing saved server-side
-    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
-    res.setHeader('Pragma', 'no-cache');
-    res.setHeader('Expires', '0');
-    res.setHeader('Content-Disposition', 'inline; filename="schedule.png"');
-    res.setHeader('Content-Type', 'image/png');
-    return res.status(200).send(pngBuffer);
-  } catch (e) {
-    console.error('capture-schedule failed:', e);
-    return res.status(500).json({ error: 'capture_failed', details: String(e) });
-  }
-});
-
 // ---------- Route: capture TEXT + structured rows from the widget (no PNG needed) ----------
 // GET /capture-schedule-text?start=YYYY-MM-DD&end=YYYY-MM-DD[&url=...]
 app.get('/capture-schedule-text', async (req, res) => {
@@ -173,12 +18,72 @@ app.get('/capture-schedule-text', async (req, res) => {
         });
       }
 
-      const frameEl = await page.waitForSelector('iframe[src*="widget.hellowalla.com"]', { timeout: 45000 });
-      const frame = await frameEl.contentFrame();
+      // Wait for widget iframe
+      const iframeEl = await page.waitForSelector('iframe[src*="widget.hellowalla.com"]', { timeout: 45000 });
+      const frame = await iframeEl.contentFrame();
       if (!frame) throw new Error('widget_frame_not_ready');
 
-      // Give the widget a moment to render
-      await frame.waitForTimeout(1200);
+      // ---- NEW: Navigate to the requested date (use start= as target) ----
+      const targetDate = startISO;  // click this day in the widget tabs
+      await frame.waitForTimeout(1000);
+
+      await frame.evaluate((iso) => {
+        // Build a few label variants the widget uses in its tabs/headers
+        const d = new Date(iso + 'T12:00:00');
+        const dowShort = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][d.getUTCDay()];
+        const dowLong  = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'][d.getUTCDay()];
+        const monShort = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][d.getUTCMonth()];
+        const monLong  = ['January','February','March','April','May','June','July','August','September','October','November','December'][d.getUTCMonth()];
+        const day      = d.getUTCDate();
+
+        const candidates = new Set([
+          `${dowShort} ${monShort} ${day}`,             // "Wed Sep 3"
+          `${monShort} ${day}`,                        // "Sep 3"
+          `${dowLong.toUpperCase()}, ${monLong.toUpperCase()} ${day}`, // "WEDNESDAY, SEPTEMBER 3"
+          `${dowLong}, ${monLong} ${day}`,             // "Wednesday, September 3"
+        ]);
+
+        // Click any element whose text matches one of the labels
+        const clickables = Array.from(document.querySelectorAll('button,[role=tab],a,[role=button],.tab,.day')).filter(Boolean);
+        const norm = s => (s||'').replace(/\s+/g,' ').trim();
+        let clicked = false;
+
+        for (const el of clickables) {
+          const t = norm(el.innerText || el.textContent || '');
+          for (const want of candidates) {
+            if (t.includes(want)) {
+              el.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+              clicked = true;
+              break;
+            }
+          }
+          if (clicked) break;
+        }
+
+        // If tabs didn’t match, try clicking the “next-day” control a few times
+        if (!clicked) {
+          const nextSelectors = [
+            '[data-testid*="next"]',
+            'button:has(svg[aria-label*="Next"])',
+            'button:has(path[d])', // weak fallback
+          ];
+          const header = document.body.innerText || '';
+          function headerHasWanted() {
+            const H = header.toUpperCase();
+            return H.includes(`${monLong.toUpperCase()} ${day}`) || H.includes(`${monShort.toUpperCase()} ${day}`);
+          }
+          let tries = 7;
+          while (!headerHasWanted() && tries-- > 0) {
+            for (const s of nextSelectors) {
+              const btn = document.querySelector(s);
+              if (btn) { btn.dispatchEvent(new MouseEvent('click', { bubbles: true })); break; }
+            }
+          }
+        }
+      }, targetDate);
+
+      // Let the UI update
+      await frame.waitForTimeout(800);
 
       // 1) Raw text snapshot (debug)
       const text = await frame.evaluate(() => document.body.innerText || '');
@@ -189,7 +94,6 @@ app.get('/capture-schedule-text', async (req, res) => {
         const qAll = (sel, root = document) => Array.from(root.querySelectorAll(sel));
         const txt  = (el) => (el?.innerText || '').trim();
 
-        // Class "rows" — wide net, filter by presence of time
         const candidates = qAll('[data-testid="class-row"], .class-row, .schedule-row, .class-item, li, tr, .row')
           .filter(el => (el && txt(el).length > 0));
 
@@ -213,23 +117,18 @@ app.get('/capture-schedule-text', async (req, res) => {
           const time = tm ? `${tm[1]} ${tm[2].toUpperCase()}` : '';
           if (!time) continue;
 
-          // Prefer explicit title nodes
           let class_name = '';
           const nameEl = row.querySelector('a, .class-title, [data-testid="class-name"], h3, h4, [role="heading"]');
           if (nameEl) class_name = txt(nameEl);
-
-          // Fallback: scan nearby lines
           if (!class_name) {
             const parts = rowText.split('\n').map(s => s.trim()).filter(Boolean);
             for (const p of parts) { if (isCandidateName(p)) { class_name = p; break; } }
           }
 
-          // Instructor (e.g., "w/ Ana Maria")
           let instructor = '';
           const im = rowText.match(/w\/\s*([A-Za-z][A-Za-z .'-]+)/i);
           if (im) instructor = im[1].trim();
 
-          // Spots badge or button text
           const badges = qAll('span, div, button', row).map(txt);
           const spotsLabel = badges.find(t => SPOTS_RE.test(t));
           const btnText    = badges.find(t => /book|waitlist|sold\s*out|full/i.test(t)) || '';
@@ -249,9 +148,8 @@ app.get('/capture-schedule-text', async (req, res) => {
             status = 'full';
             if (open_spots === null) open_spots = 0;
           } else if (/book/i.test(btnText) && open_spots === null) {
-            // "Book" with no numeric badge -> open, unknown count (null)
             status = 'open';
-            open_spots = null;
+            open_spots = null; // count not visible
           }
 
           if (time && (class_name || status !== 'unknown')) {
@@ -266,7 +164,7 @@ app.get('/capture-schedule-text', async (req, res) => {
           }
         }
 
-        // Deduplicate by date|time|class_name
+        // Deduplicate
         const seen = new Set();
         const dedup = [];
         for (const r of out) {
@@ -287,14 +185,3 @@ app.get('/capture-schedule-text', async (req, res) => {
     return res.status(500).json({ error: 'text_capture_failed', details: String(e) });
   }
 });
-
-// ---------- Global error handler ----------
-app.use((err, _req, res, _next) => {
-  console.error('Unhandled error:', err);
-  if (res.headersSent) return;
-  res.status(500).json({ error: 'internal_error', details: String(err) });
-});
-
-// ---------- Start ----------
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log('walla-capture listening on ' + PORT));
