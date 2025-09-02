@@ -73,7 +73,7 @@ async function withBrowser(fn, { dpr = 2 } = {}) {
     const page = await context.newPage();
     await page.setViewportSize({ width: 1360, height: 1800 });
 
-    // Block some trackers that hold long connections
+    // Block trackers that hold long connections
     await page.route('**/*', (route) => {
       const u = route.request().url();
       if (/\b(googletagmanager|google-analytics|doubleclick|hotjar|facebook|segment|sentry|intercom|hs-scripts)\b/i.test(u)) {
@@ -98,11 +98,85 @@ async function getWallaFrameByScan(page, { timeoutMs = 45000 } = {}) {
   throw new Error('widget_frame_not_ready');
 }
 
+// -------- Visible date extraction inside iframe --------
+async function extractVisibleDateISO(frame, targetYear) {
+  // Parse headers like: "TUESDAY, SEPTEMBER 2" or "Tuesday, September 2"
+  return await frame.evaluate((year) => {
+    const MONTHS = {
+      JANUARY:1,FEBRUARY:2,MARCH:3,APRIL:4,MAY:5,JUNE:6,JULY:7,AUGUST:8,SEPTEMBER:9,OCTOBER:10,NOVEMBER:11,DECEMBER:12
+    };
+    function norm(s){ return (s||'').replace(/\s+/g,' ').trim(); }
+
+    const all = Array.from(document.querySelectorAll('h1,h2,h3,h4,[role=heading],.date-header,.day-header,.schedule-day-header, .walla-date, .day-title'))
+      .map(el => norm(el.innerText||el.textContent||''))
+      .filter(Boolean);
+
+    for (const t of all) {
+      const m = t.match(/^(?:SUNDAY|MONDAY|TUESDAY|WEDNESDAY|THURSDAY|FRIDAY|SATURDAY),?\s+([A-Z]+)\s+(\d{1,2})$/i);
+      if (m) {
+        const monthName = m[1].toUpperCase();
+        const day = parseInt(m[2],10);
+        const month = MONTHS[monthName];
+        if (month && day >= 1 && day <= 31) {
+          const mm = String(month).padStart(2,'0');
+          const dd = String(day).padStart(2,'0');
+          return `${year}-${mm}-${dd}`;
+        }
+      }
+    }
+    // Fallback: try body text scan (cheap)
+    const body = norm(document.body.innerText||'');
+    const m2 = body.match(/(?:SUNDAY|MONDAY|TUESDAY|WEDNESDAY|THURSDAY|FRIDAY|SATURDAY),?\s+([A-Z]+)\s+(\d{1,2})/i);
+    if (m2) {
+      const MONTHS2 = MONTHS;
+      const monthName = m2[1].toUpperCase();
+      const day = parseInt(m2[2],10);
+      const month = MONTHS2[monthName];
+      if (month && day>=1 && day<=31) {
+        const mm = String(month).padStart(2,'0');
+        const dd = String(day).padStart(2,'0');
+        return `${year}-${mm}-${dd}`;
+      }
+    }
+    return null;
+  }, targetYear);
+}
+
+// -------- Try to switch the iframe to the requested date --------
+async function ensureDay(frame, startISO) {
+  // Click "Daily" and the tab for the target day (Mon Sep 3, etc.)
+  await frame.evaluate((iso) => {
+    const d = new Date(iso + 'T12:00:00'); // local TZ in context
+    const dowShort = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][d.getDay()];
+    const monShort = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][d.getMonth()];
+    const day = d.getDate();
+    const norm = (s) => (s||'').replace(/\s+/g,' ').trim();
+
+    const dailyBtn = Array.from(document.querySelectorAll('button,[role=tab],a,[role=button]'))
+      .find(el => /^daily$/i.test(norm(el.innerText||el.textContent||'')));
+    if (dailyBtn) dailyBtn.dispatchEvent(new MouseEvent('click',{bubbles:true}));
+
+    const tabVariants = new Set([`${dowShort} ${monShort} ${day}`, `${monShort} ${day}`, `${dowShort} ${day}`]);
+    const tabs = Array.from(document.querySelectorAll('button,[role=tab],a,[role=button],.tab,.day'));
+    for (const el of tabs) {
+      const t = norm(el.innerText||el.textContent||'');
+      for (const v of tabVariants) {
+        if (t.includes(v)) {
+          el.dispatchEvent(new MouseEvent('click',{bubbles:true}));
+          return;
+        }
+      }
+    }
+    window.scrollTo(0,0);
+  }, startISO).catch(()=>{});
+}
+
 // -------- Plain-text fallback parser (with price) --------
-function parseFromPlainText(text, iso) {
+function parseFromPlainText(text, visibleISO) {
   if (!text) return [];
 
-  const d = new Date(iso + 'T12:00:00Z');
+  // visibleISO is what we'll stamp rows with
+  const d = new Date(visibleISO + 'T12:00:00Z');
   const dowLong = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'][d.getUTCDay()];
   const monLong = ['January','February','March','April','May','June','July','August','September','October','November','December'][d.getUTCMonth()];
   const monShort = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][d.getUTCMonth()];
@@ -146,7 +220,7 @@ function parseFromPlainText(text, iso) {
     if (!cur) return;
     if (cur.time && (cur.class_name || cur.status !== 'unknown')) {
       rows.push({
-        date: iso,
+        date: visibleISO,
         time: cur.time,
         class_name: cur.class_name || '',
         instructor: cur.instructor || '',
@@ -160,8 +234,7 @@ function parseFromPlainText(text, iso) {
   }
 
   for (let i = 0; i < section.length; i++) {
-    const raw = section[i];
-    const t = norm(raw);
+    const t = norm(section[i]);
 
     const tm = t.match(TIME_RE);
     if (tm) {
@@ -171,12 +244,8 @@ function parseFromPlainText(text, iso) {
     }
     if (!cur) continue;
 
-    // price (capture before dropping line)
     const pm = t.match(PRICE_RE);
-    if (pm) {
-      cur.price = parseFloat(pm[1]);
-      cur.price_text = `$${pm[1]}`;
-    }
+    if (pm) { cur.price = parseFloat(pm[1]); cur.price_text = `$${pm[1]}`; }
 
     if (IGNORE.has(t)) continue;
     if (DROPIN_RE.test(t)) continue;
@@ -245,13 +314,13 @@ app.get('/capture-schedule', async (req, res) => {
   }
 });
 
-// ---------- Text + structured rows (stronger waits + price) ----------
+// ---------- Text + structured rows (date-correct, with price) ----------
 app.get('/capture-schedule-text', async (req, res) => {
   const startISO = toISO(req.query.start);
   const endISO   = toISO(req.query.end);
   const referer  = String(req.query.url || '');
   const debug    = String(req.query.debug || '0') === '1';
-  const delayMs  = Number(req.query.delay || 1800);   // NEW: tunable extra wait
+  const delayMs  = Number(req.query.delay || 1800);
 
   try {
     const result = await withBrowser(async ({ page }) => {
@@ -266,7 +335,7 @@ app.get('/capture-schedule-text', async (req, res) => {
       // Find widget frame
       let frame = await getWallaFrameByScan(page, { timeoutMs: 45000 });
 
-      // Force frame to start/end
+      // Force frame to start/end in URL (widget respects these)
       try {
         await frame.evaluate(([isoStart, isoEnd]) => {
           try {
@@ -277,52 +346,32 @@ app.get('/capture-schedule-text', async (req, res) => {
           } catch {}
         }, [startISO, endISO]);
 
-        // give it a moment to reload and re-acquire the frame
         await page.waitForTimeout(1200);
         frame = await getWallaFrameByScan(page, { timeoutMs: 20000 });
       } catch {}
 
-      // Try toggling to "Daily" + click the target day tab
-      await frame.evaluate((iso) => {
-        const d = new Date(iso + 'T12:00:00');
-        const dowShort = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][d.getUTCDay()];
-        const monShort = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][d.getUTCMonth()];
-        const day = d.getUTCDate();
-        const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
+      // Try to move to correct day via UI controls
+      await ensureDay(frame, startISO).catch(()=>{});
 
-        const dailyBtn = Array.from(document.querySelectorAll('button,[role=tab],a,[role=button]'))
-          .find(el => /^daily$/i.test(norm(el.innerText || el.textContent || '')));
-        if (dailyBtn) dailyBtn.dispatchEvent(new MouseEvent('click', { bubbles: true }));
-
-        const tabVariants = new Set([`${dowShort} ${monShort} ${day}`, `${monShort} ${day}`, `${dowShort} ${day}`]);
-        const tabs = Array.from(document.querySelectorAll('button,[role=tab],a,[role=button],.tab,.day'));
-        for (const el of tabs) {
-          const t = norm(el.innerText || el.textContent || '');
-          for (const v of tabVariants) {
-            if (t.includes(v)) {
-              el.dispatchEvent(new MouseEvent('click', { bubbles: true }));
-              break;
-            }
-          }
-        }
-        window.scrollTo(0, 0);
-      }, startISO).catch(()=>{});
-
-      // **Critical waits** for visible content
-      // 1) brief fixed delay for layout
+      // Wait for content to settle
       await frame.waitForTimeout(delayMs);
-
-      // 2) wait until the BODY text includes a time or a booking action
       await frame.waitForFunction(() => {
         const t = (document.body.innerText || '').trim();
         return /\b([0-1]?\d:[0-5]\d)\s*(AM|PM)\b/i.test(t) || /Book|Waitlist|Sold\s*Out|Full/i.test(t);
       }, { timeout: 20000 }).catch(()=>{});
 
-      // Snapshot text for fallback/debug
+      // Determine the visible date the widget is actually showing
+      const targetYear = new Date(startISO + 'T00:00:00').getFullYear();
+      let visibleISO = await extractVisibleDateISO(frame, targetYear);
+      if (!visibleISO) visibleISO = startISO; // fallback if header not found
+
+      const day_mismatch = visibleISO !== startISO;
+
+      // Grab text for fallback/debug
       const text = await frame.evaluate(() => document.body.innerText || '').catch(() => '');
 
       // ---------- DOM parser (global) ----------
-      const parsedDom = await frame.evaluate((iso) => {
+      const parsedDom = await frame.evaluate((visibleISO) => {
         const out = [];
         const qAll = (sel, r = document) => Array.from(r.querySelectorAll(sel));
         const txt  = (el) => (el?.innerText || '').trim();
@@ -369,30 +418,39 @@ app.get('/capture-schedule-text', async (req, res) => {
           else if (/sold\s*out|^full$/i.test(btnText)) { status = 'full'; if (open_spots === null) open_spots = 0; }
           else if (/book/i.test(btnText) && open_spots === null) { status = 'open'; open_spots = null; }
 
-          out.push({ date: iso, time, class_name, instructor, status, open_spots, price, price_text });
+          out.push({ date: visibleISO, time, class_name, instructor, status, open_spots, price, price_text });
         }
 
         // Dedup
         const seen = new Set(); const dedup = [];
         for (const r of out) { const k = `${r.date}|${r.time}|${r.class_name}`; if (seen.has(k)) continue; seen.add(k); dedup.push(r); }
         return dedup;
-      }, startISO).catch(() => []);
+      }, visibleISO).catch(() => []);
 
-      // If DOM parse failed, try plain text
+      // If DOM parse failed, try plain text (stamped with visibleISO)
       let parse_mode = 'global-dom';
       let parsed = parsedDom;
       if (!parsed || parsed.length === 0) {
         parse_mode = 'text';
-        parsed = parseFromPlainText(text, startISO);
+        parsed = parseFromPlainText(text, visibleISO);
       }
 
-      return { parsed, parse_mode, text: debug ? text : undefined, frames: debug ? page.frames().map(fr => fr.url()) : undefined };
+      return {
+        parsed,
+        parse_mode,
+        visible_date_iso: visibleISO,
+        day_mismatch,
+        text: debug ? text : undefined,
+        frames: debug ? page.frames().map(fr => fr.url()) : undefined
+      };
     });
 
     return res.json({
       start: startISO,
       end: endISO,
       parse_mode: result.parse_mode || null,
+      visible_date_iso: result.visible_date_iso || null,
+      day_mismatch: !!result.day_mismatch,
       parsed: result.parsed || [],
       ...(debug ? { text: result.text || '', frames: result.frames || [] } : {}),
     });
