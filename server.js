@@ -1,13 +1,115 @@
-// ---------- Route: capture TEXT + structured rows from the widget (no PNG needed) ----------
-// GET /capture-schedule-text?start=YYYY-MM-DD&end=YYYY-MM-DD[&url=...]
-app.get('/capture-schedule-text', async (req, res) => {
+// server.js
+// Run with: node server.js
+// One-time setup (in your image or host): npx playwright install --with-deps
+
+import express from 'express';
+import cors from 'cors';
+import { chromium, devices } from 'playwright';
+
+const app = express();
+app.use(cors());
+app.use(express.json({ limit: '1mb' }));
+
+// ---------- Health ----------
+app.get('/healthz', (_req, res) => res.send('ok'));
+
+// ---------- Auth (x-api-key or ?key=...) ----------
+app.use((req, res, next) => {
+  const AUTH_TOKEN = process.env.SCRAPER_TOKEN || '';
+  if (!AUTH_TOKEN) return next(); // no auth if not set
+  const token = req.get('x-api-key') || req.query.key;
+  if (token === AUTH_TOKEN) return next();
+  return res.status(401).json({ error: 'unauthorized' });
+});
+
+// ---------- Configurable widget identity (envs optional) ----------
+const WALLA_UUID = process.env.WALLA_UUID || '3f4c5689-8468-47d5-a722-c0ab605b2da4';
+const WALLA_LOCATION_ID = process.env.WALLA_LOCATION_ID || '3589';
+
+// ---------- Local HTML shell for the widget ----------
+const LOCAL_HTML = ({ start, end }) =>
+  '<!doctype html><html><head><meta charset="utf-8"/></head><body>' +
+  '<div class="walla-widget-root" ' +
+  `data-walla-id="${WALLA_UUID}" ` +
+  'data-walla-page="classes" ' +
+  `data-walla-locationid="${WALLA_LOCATION_ID}" ` +
+  `data-start="${start || ''}" data-end="${end || ''}"></div>` +
+  '<script>(function(w,a,l,la,j,s){' +
+  'const t=a.getElementById("walla-widget-script"); if(t) return;' +
+  'j=a.createElement(l); j.async=1; j.src=la; j.id="walla-widget-script";' +
+  's=a.getElementsByTagName(l)[0]||a.body; s.parentNode.insertBefore(j,s);' +
+  '})(window,document,"script","https://widget.hellowalla.com/loader/v1/walla-widget-loader.js");</script>' +
+  '</body></html>';
+
+// ---------- Helpers ----------
+const toISO = (v) => (v || '').toString().slice(0, 10);
+
+async function withBrowser(fn, { dpr = 2 } = {}) {
+  const browser = await chromium.launch({
+    headless: true,
+    args: [
+      '--no-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-web-security',
+      '--disable-features=IsolateOrigins,site-per-process',
+    ],
+  });
+
+  try {
+    const context = await browser.newContext({
+      ...devices['Desktop Chrome'],
+      deviceScaleFactor: Math.max(1, Math.min(4, Number(dpr) || 2)),
+      ignoreHTTPSErrors: true,
+      locale: 'en-US',
+      timezoneId: 'America/New_York',
+      userAgent:
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+        '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    });
+    context.setDefaultNavigationTimeout(120000);
+    context.setDefaultTimeout(90000);
+
+    await context.addInitScript(() => {
+      Object.defineProperty(navigator, 'webdriver', { get: () => false });
+    });
+
+    const page = await context.newPage();
+    await page.setViewportSize({ width: 1360, height: 1800 });
+
+    // Block common trackers that keep long connections open
+    await page.route('**/*', (route) => {
+      const u = route.request().url();
+      if (/\b(googletagmanager|google-analytics|doubleclick|hotjar|facebook|segment|sentry|intercom|hs-scripts)\b/i.test(u)) {
+        return route.abort();
+      }
+      route.continue();
+    });
+
+    return await fn({ browser, context, page });
+  } finally {
+    await browser.close();
+  }
+}
+
+async function getWidgetFrame(page) {
+  const iframeEl = await page.waitForSelector('iframe[src*="widget.hellowalla.com"]', { timeout: 45000 });
+  const frame = await iframeEl.contentFrame();
+  if (!frame) throw new Error('widget_frame_not_ready');
+  return { iframeEl, frame };
+}
+
+// ---------- PNG capture (optional, for audits/OCR) ----------
+// GET /capture-schedule?start=YYYY-MM-DD&end=YYYY-MM-DD[&url=...][&dpr=2][&delay=1500][&fullPage=0]
+app.get('/capture-schedule', async (req, res) => {
   const startISO = toISO(req.query.start);
   const endISO   = toISO(req.query.end);
+  const dpr      = Number(req.query.dpr || 2);
+  const delayMs  = Number(req.query.delay || 1500);
+  const fullPage = String(req.query.fullPage || '0') === '1';
   const referer  = String(req.query.url || '');
 
   try {
-    const out = await withBrowser(async ({ page }) => {
-      // Lightweight nav (no networkidle)
+    const pngBuffer = await withBrowser(async ({ page }) => {
       if (referer) {
         await page.goto(referer, { waitUntil: 'domcontentloaded', timeout: 120000 });
         await page.waitForLoadState('load', { timeout: 15000 }).catch(() => {});
@@ -18,74 +120,88 @@ app.get('/capture-schedule-text', async (req, res) => {
         });
       }
 
-      // Wait for widget iframe
-      const iframeEl = await page.waitForSelector('iframe[src*="widget.hellowalla.com"]', { timeout: 45000 });
-      const frame = await iframeEl.contentFrame();
-      if (!frame) throw new Error('widget_frame_not_ready');
+      const { frame } = await getWidgetFrame(page);
 
-      // ---- NEW: Navigate to the requested date (use start= as target) ----
-      const targetDate = startISO;  // click this day in the widget tabs
-      await frame.waitForTimeout(1000);
-
-      await frame.evaluate((iso) => {
-        // Build a few label variants the widget uses in its tabs/headers
-        const d = new Date(iso + 'T12:00:00');
-        const dowShort = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][d.getUTCDay()];
-        const dowLong  = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'][d.getUTCDay()];
-        const monShort = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][d.getUTCMonth()];
-        const monLong  = ['January','February','March','April','May','June','July','August','September','October','November','December'][d.getUTCMonth()];
-        const day      = d.getUTCDate();
-
-        const candidates = new Set([
-          `${dowShort} ${monShort} ${day}`,             // "Wed Sep 3"
-          `${monShort} ${day}`,                        // "Sep 3"
-          `${dowLong.toUpperCase()}, ${monLong.toUpperCase()} ${day}`, // "WEDNESDAY, SEPTEMBER 3"
-          `${dowLong}, ${monLong} ${day}`,             // "Wednesday, September 3"
-        ]);
-
-        // Click any element whose text matches one of the labels
-        const clickables = Array.from(document.querySelectorAll('button,[role=tab],a,[role=button],.tab,.day')).filter(Boolean);
-        const norm = s => (s||'').replace(/\s+/g,' ').trim();
-        let clicked = false;
-
-        for (const el of clickables) {
-          const t = norm(el.innerText || el.textContent || '');
-          for (const want of candidates) {
-            if (t.includes(want)) {
-              el.dispatchEvent(new MouseEvent('click', { bubbles: true }));
-              clicked = true;
-              break;
-            }
-          }
-          if (clicked) break;
+      // Lazy-load guard: scroll the frame a bit
+      await frame.evaluate(async () => {
+        const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+        for (let i = 0; i < 4; i++) {
+          window.scrollTo(0, document.body.scrollHeight);
+          await sleep(200);
         }
+        window.scrollTo(0, 0);
+      });
 
-        // If tabs didn’t match, try clicking the “next-day” control a few times
-        if (!clicked) {
-          const nextSelectors = [
-            '[data-testid*="next"]',
-            'button:has(svg[aria-label*="Next"])',
-            'button:has(path[d])', // weak fallback
-          ];
-          const header = document.body.innerText || '';
-          function headerHasWanted() {
-            const H = header.toUpperCase();
-            return H.includes(`${monLong.toUpperCase()} ${day}`) || H.includes(`${monShort.toUpperCase()} ${day}`);
-          }
-          let tries = 7;
-          while (!headerHasWanted() && tries-- > 0) {
-            for (const s of nextSelectors) {
-              const btn = document.querySelector(s);
-              if (btn) { btn.dispatchEvent(new MouseEvent('click', { bubbles: true })); break; }
-            }
-          }
+      await page.waitForTimeout(delayMs);
+
+      return fullPage
+        ? await page.screenshot({ type: 'png', fullPage: true })
+        : await frame.locator('body').screenshot({ type: 'png' });
+    }, { dpr });
+
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+    res.setHeader('Content-Disposition', 'inline; filename="schedule.png"');
+    res.setHeader('Content-Type', 'image/png');
+    return res.status(200).send(pngBuffer);
+  } catch (e) {
+    console.error('capture-schedule failed:', e);
+    return res.status(500).json({ error: 'capture_failed', details: String(e) });
+  }
+});
+
+// ---------- Text + structured rows (forces iframe date) ----------
+// GET /capture-schedule-text?start=YYYY-MM-DD&end=YYYY-MM-DD[&url=...]
+app.get('/capture-schedule-text', async (req, res) => {
+  const startISO = toISO(req.query.start);
+  const endISO   = toISO(req.query.end);
+  const referer  = String(req.query.url || '');
+
+  try {
+    const out = await withBrowser(async ({ page }) => {
+      // Navigate real page or use local shell
+      if (referer) {
+        await page.goto(referer, { waitUntil: 'domcontentloaded', timeout: 120000 });
+        await page.waitForLoadState('load', { timeout: 15000 }).catch(() => {});
+      } else {
+        await page.setContent(LOCAL_HTML({ start: startISO, end: endISO }), {
+          waitUntil: 'domcontentloaded',
+          timeout: 60000,
+        });
+      }
+
+      // Find widget iframe
+      const { iframeEl, frame: initialFrame } = await getWidgetFrame(page);
+      let frame = initialFrame;
+
+      // --- HARD-SET start/end on iframe src (forces the correct day) ---
+      const changed = await page.evaluate((isoStart, isoEnd) => {
+        const f = document.querySelector('iframe[src*="widget.hellowalla.com"]');
+        if (!f) return { changed: false, url: null };
+        try {
+          const u = new URL(f.src, location.href);
+          let mutated = false;
+          if (isoStart && u.searchParams.get('start') !== isoStart) { u.searchParams.set('start', isoStart); mutated = true; }
+          if (isoEnd   && u.searchParams.get('end')   !== isoEnd)   { u.searchParams.set('end', isoEnd);     mutated = true; }
+          if (mutated) f.src = u.toString();
+          return { changed: mutated, url: u.toString() };
+        } catch (e) {
+          return { changed: false, url: null, error: String(e) };
         }
-      }, targetDate);
+      }, startISO, endISO);
 
-      // Let the UI update
-      await frame.waitForTimeout(800);
+      if (changed.changed) {
+        // Wait a moment for the iframe to reload to the new date
+        await page.waitForTimeout(1200);
+        frame = await iframeEl.contentFrame();
+        await page.waitForTimeout(600);
+      }
 
-      // 1) Raw text snapshot (debug)
+      // Let UI paint
+      await frame.waitForTimeout(1200);
+
+      // 1) Raw text snapshot (debug aid)
       const text = await frame.evaluate(() => document.body.innerText || '');
 
       // 2) Structured parse directly from DOM
@@ -95,7 +211,7 @@ app.get('/capture-schedule-text', async (req, res) => {
         const txt  = (el) => (el?.innerText || '').trim();
 
         const candidates = qAll('[data-testid="class-row"], .class-row, .schedule-row, .class-item, li, tr, .row')
-          .filter(el => (el && txt(el).length > 0));
+          .filter(el => el && txt(el).length > 0);
 
         const TIME_RE  = /\b([0-1]?\d:[0-5]\d)\s*([AP]M)\b/i;
         const SPOTS_RE = /\b(\d+)\s*SPOTS?\b/i;
@@ -117,6 +233,7 @@ app.get('/capture-schedule-text', async (req, res) => {
           const time = tm ? `${tm[1]} ${tm[2].toUpperCase()}` : '';
           if (!time) continue;
 
+          // Class name
           let class_name = '';
           const nameEl = row.querySelector('a, .class-title, [data-testid="class-name"], h3, h4, [role="heading"]');
           if (nameEl) class_name = txt(nameEl);
@@ -125,10 +242,12 @@ app.get('/capture-schedule-text', async (req, res) => {
             for (const p of parts) { if (isCandidateName(p)) { class_name = p; break; } }
           }
 
+          // Instructor (e.g., "w/ Ana Maria")
           let instructor = '';
           const im = rowText.match(/w\/\s*([A-Za-z][A-Za-z .'-]+)/i);
           if (im) instructor = im[1].trim();
 
+          // Spots badge or button text
           const badges = qAll('span, div, button', row).map(txt);
           const spotsLabel = badges.find(t => SPOTS_RE.test(t));
           const btnText    = badges.find(t => /book|waitlist|sold\s*out|full/i.test(t)) || '';
@@ -148,8 +267,9 @@ app.get('/capture-schedule-text', async (req, res) => {
             status = 'full';
             if (open_spots === null) open_spots = 0;
           } else if (/book/i.test(btnText) && open_spots === null) {
+            // "Book" without numeric badge -> open but unknown count
             status = 'open';
-            open_spots = null; // count not visible
+            open_spots = null;
           }
 
           if (time && (class_name || status !== 'unknown')) {
@@ -185,3 +305,7 @@ app.get('/capture-schedule-text', async (req, res) => {
     return res.status(500).json({ error: 'text_capture_failed', details: String(e) });
   }
 });
+
+// ---------- Start ----------
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, () => console.log('walla-capture listening on ' + PORT));
