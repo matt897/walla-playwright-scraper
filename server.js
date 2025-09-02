@@ -49,11 +49,12 @@ function normalize(list = []) {
       end_time: c.end ?? c.endTime ?? null,
       room: c.room ?? c.roomName ?? '',
       location_id: c.locationId ?? 3589,
-      capacity: cap,
-      booked,
-      open_spots: open,
-      waitlist_count: Number(c.waitlist ?? c.waitlistCount ?? 0),
+      capacity: cap || null,
+      booked: booked || null,
+      open_spots: open || 0,
+      waitlist_count: Number(c.waitlist ?? c.waitlistCount ?? 0) || null,
       has_open_spots: open > 0,
+      status: open > 0 ? 'open' : (cap ? 'full' : 'unknown'),
     };
   });
 }
@@ -83,6 +84,7 @@ function summarizeClassesNY(list = [], defaultDateISO = '') {
       open_spots: c.open_spots ?? 0,
       class_name: c.class_name ?? '',
       instructor: c.instructor ?? '',
+      status: c.status ?? undefined,
     };
   });
 }
@@ -131,6 +133,25 @@ async function getWidgetFrame(page) {
   return frame;
 }
 
+// ---------- Inspect widget API fields (optional helper) ----------
+app.get('/inspect-widget', async (req, res) => {
+  const start = toISODateStr(req.query.start);
+  const end   = toISODateStr(req.query.end);
+  const uuid  = req.query.uuid || process.env.WALLA_UUID || '3f4c5689-8468-47d5-a722-c0ab605b2da4';
+  const locationId = req.query.locationId || process.env.WALLA_LOCATION_ID || '3589';
+
+  const url = `https://widget.hellowalla.com/api/classes?uuid=${encodeURIComponent(uuid)}&locationId=${encodeURIComponent(locationId)}${start?`&start=${start}`:''}${end?`&end=${end}`:''}`;
+  try {
+    const r = await fetch(url, { headers: { 'Accept':'application/json' }});
+    const data = await r.json().catch(()=>[]);
+    const rows = Array.isArray(data) ? data : (Array.isArray(data?.data) ? data.data : []);
+    const keys = [...new Set(rows.flatMap(o => Object.keys(o||{})))].sort();
+    res.json({ count: rows.length, keys, sample: rows.slice(0,3) });
+  } catch (e) {
+    res.status(500).json({ error: 'inspect_failed', details: String(e) });
+  }
+});
+
 // ---------- Main endpoint: /scrape-classes ----------
 app.get('/scrape-classes', async (req, res) => {
   const {
@@ -167,11 +188,8 @@ app.get('/scrape-classes', async (req, res) => {
           waitUntil: 'domcontentloaded',
           timeout: 60000,
         });
-        // ensure loader exists (LOCAL_HTML already injects it)
         try {
-          await page.addScriptTag({
-            url: 'https://widget.hellowalla.com/loader/v1/walla-widget-loader.js',
-          });
+          await page.addScriptTag({ url: 'https://widget.hellowalla.com/loader/v1/walla-widget-loader.js' });
         } catch { /* ignore */ }
       }
 
@@ -180,61 +198,88 @@ app.get('/scrape-classes', async (req, res) => {
         await page.waitForSelector('iframe[src*="hellowalla"], [data-walla-page="classes"]', { timeout: 20000 });
       } catch { /* ignore */ }
 
-      // ---------- MODE: DOM (read badges from rendered UI) ----------
+      // ---------- MODE: DOM (read badges/buttons from rendered UI) ----------
       if (mode === 'dom') {
         const frame = await getWidgetFrame(page);
-        // Extract rows that contain "SPOT/ SPOTS" badges
+
         const rows = await frame.evaluate((defaultDate) => {
           const out = [];
-          const q = (sel, root=document) => Array.from(root.querySelectorAll(sel));
-          const getText = (el) => (el?.innerText || '').trim();
+          const qAll = (sel, root = document) => Array.from(root.querySelectorAll(sel));
+          const txt = (el) => (el?.innerText || '').trim();
 
-          // Find any element whose text looks like "2 SPOTS" or "1 SPOT" or "0 SPOTS"
-          const badgeEls = q('span,div').filter(el => /\b\d+\s*SPOTS?\b/i.test(getText(el)));
+          // Iterate likely "row" containers to avoid duplicates
+          const candidates = qAll('[data-testid="class-row"], .class-row, .schedule-row, li, tr, .row, .class-item, .list-item')
+            .filter(el => txt(el).length > 0);
 
-          for (const badge of badgeEls) {
-            const badgeText = getText(badge);
-            const m = badgeText.match(/(\d+)\s*SPOTS?/i);
-            const open = m ? parseInt(m[1], 10) : 0;
+          for (const row of candidates) {
+            const rowText = txt(row);
 
-            // Move up to a probable "row"
-            const row =
-              badge.closest('[data-testid="class-row"], .class-row, .schedule-row, li, tr, .row, .class-item, .list-item') ||
-              badge.parentElement;
-
-            const rowText = getText(row);
-            // Time: e.g., "8:15 AM" / "5:45 PM"
+            // Time like "8:15 AM"
             const tm = rowText.match(/\b([0-1]?\d:[0-5]\d)\s*([AP]M)\b/i);
-            const time = tm ? (tm[1] + ' ' + tm[2].toUpperCase()) : '';
+            const time = tm ? `${tm[1]} ${tm[2].toUpperCase()}` : '';
 
-            // Class name: guess common selectors; fallback to first non-empty link/header
+            // Class name
             const nameEl = row.querySelector('a, .class-title, [data-testid="class-name"], h3, h4');
-            let class_name = getText(nameEl);
+            let class_name = txt(nameEl);
             if (!class_name) {
-              // try first link text in the row
-              const a = row.querySelector('a');
-              class_name = getText(a) || (rowText.split('\n').map(s => s.trim()).filter(Boolean)[0] || '');
+              const firstLine = rowText.split('\n').map(s => s.trim()).filter(Boolean)[0] || '';
+              class_name = firstLine;
             }
 
-            // Instructor: look for "w/ NAME" pattern or a label near the title
+            // Instructor (pattern "w/ Ana Maria")
             let instructor = '';
             const im = rowText.match(/w\/\s*([A-Za-z][A-Za-z .'-]+)/i);
             if (im) instructor = im[1];
 
+            // Spots badge (e.g., "2 SPOTS", "1 SPOT", "0 SPOTS")
+            const spotLabel = qAll('span, div', row).map(txt).find(t => /\b\d+\s*SPOTS?\b/i.test(t));
+            let open_spots = null;
+            if (spotLabel) {
+              const m = spotLabel.match(/(\d+)\s*SPOTS?/i);
+              open_spots = m ? parseInt(m[1], 10) : 0;
+            }
+
+            // Action button text (e.g., "Book", "Waitlist", "Sold Out", "Full")
+            const btn = row.querySelector('button');
+            const btnText = txt(btn);
+
+            // Determine status
+            let status = 'unknown';
+            if (/waitlist/i.test(btnText) || /waitlist/i.test(rowText)) {
+              status = 'waitlist';
+              if (open_spots === null) open_spots = 0;
+            } else if (open_spots !== null) {
+              status = open_spots > 0 ? 'open' : 'full';
+            } else if (/book/i.test(btnText)) {
+              status = 'open';
+            } else if (/sold\s*out|full/i.test(btnText + ' ' + rowText)) {
+              status = 'full';
+              open_spots = 0;
+            }
+
+            // Only keep rows that look like legit classes (time or name present)
+            if (!time && !class_name) continue;
+
             out.push({
+              class_id: null,
               class_name,
               instructor,
-              // For DOM mode we attach date/time fields directly
+              start_time: null,
+              end_time: null,
               date: defaultDate || '',
               time,
-              open_spots: open,
-              has_open_spots: open > 0,
-              start_time: null, // unknown from DOM-only read
-              end_time: null,
+              room: '',
+              location_id: 3589,
+              capacity: null,
+              booked: null,
+              open_spots: open_spots ?? 0,
+              waitlist_count: null,
+              has_open_spots: (open_spots ?? 0) > 0,
+              status, // 'open' | 'full' | 'waitlist' | 'unknown'
             });
           }
 
-          // Deduplicate by (time + class_name)
+          // Deduplicate by (date|time|class_name)
           const seen = new Set();
           const dedup = [];
           for (const r of out) {
@@ -246,26 +291,8 @@ app.get('/scrape-classes', async (req, res) => {
           return dedup;
         }, startISO);
 
-        // Shape DOM results to share the same keys as normalize() where possible
-        const shaped = rows.map(r => ({
-          class_id: null,
-          class_name: r.class_name,
-          instructor: r.instructor,
-          start_time: r.start_time,  // null (DOM didn’t give ISO)
-          end_time: r.end_time,      // null
-          room: '',
-          location_id: 3589,
-          capacity: null,
-          booked: null,
-          open_spots: r.open_spots,
-          waitlist_count: null,
-          has_open_spots: r.has_open_spots,
-          // carry date/time for summary formatting
-          date: r.date,
-          time: r.time,
-        }));
-
-        return { classes: shaped, mode: 'dom' };
+        // Keep keys consistent with normalize() where possible
+        return { classes: rows, mode: 'dom' };
       }
 
       // ---------- MODE: JSON (listen for /api/classes) ----------
@@ -325,8 +352,8 @@ app.get('/scrape-classes', async (req, res) => {
             }
             return out;
           });
-          uuid      = uuid      || meta.uuid || '';
-          locationId= locationId|| meta.locationId || '';
+          uuid       = uuid       || meta.uuid || '';
+          locationId = locationId || meta.locationId || '';
         }
 
         const s = startISO || '';
@@ -361,7 +388,7 @@ app.get('/scrape-classes', async (req, res) => {
       if ((!classesJson || !Array.isArray(classesJson)) && debug) {
         const title = (await page.title().catch(() => '')) || '';
         const html  = (await page.content().catch(() => '')) || '';
-        return { debug: { title, sample: html.slice(0, 2000) }, classes: [] };
+        return { debug: { title, sample: html.slice(0, 2000) }, classes: [], mode: mode || 'json' };
       }
 
       return { classes: normalize(classesJson || []), mode: mode || 'json' };
@@ -370,6 +397,7 @@ app.get('/scrape-classes', async (req, res) => {
     // ---------- ALWAYS return an array (safety) ----------
     let rows = Array.isArray(result.classes) ? result.classes : [];
 
+    // optional filtering
     if (onlyOpen) rows = rows.filter((r) => (r.open_spots || 0) > 0);
 
     if (result.debug) {
