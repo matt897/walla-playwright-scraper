@@ -1,4 +1,7 @@
 // server.js
+// Run with Node 18+ (for global fetch). Install Playwright browsers once:
+//   npx playwright install --with-deps
+
 import express from 'express';
 import cors from 'cors';
 import { chromium, devices } from 'playwright';
@@ -19,13 +22,17 @@ app.use((req, res, next) => {
   return res.status(401).json({ error: 'unauthorized' });
 });
 
+// ---------- Configurable widget identity (envs optional) ----------
+const WALLA_UUID = process.env.WALLA_UUID || '3f4c5689-8468-47d5-a722-c0ab605b2da4';
+const WALLA_LOCATION_ID = process.env.WALLA_LOCATION_ID || '3589';
+
 // ---------- Local HTML shell for the widget ----------
 const LOCAL_HTML = ({ start, end }) =>
   '<!doctype html><html><head><meta charset="utf-8"/></head><body>' +
   '<div class="walla-widget-root" ' +
-  'data-walla-id="3f4c5689-8468-47d5-a722-c0ab605b2da4" ' + // set yours if different
+  `data-walla-id="${WALLA_UUID}" ` +
   'data-walla-page="classes" ' +
-  'data-walla-locationid="3589" ' +                         // set yours if different
+  `data-walla-locationid="${WALLA_LOCATION_ID}" ` +
   `data-start="${start || ''}" data-end="${end || ''}"></div>` +
   '<script>(function(w,a,l,la,j,s){' +
   'const t=a.getElementById("walla-widget-script"); if(t) return;' +
@@ -75,7 +82,6 @@ async function withBrowser(fn, { dpr = 2 } = {}) {
 const toISO = (v) => (v || '').toString().slice(0, 10);
 
 async function getWidgetFrame(page) {
-  // Wait for the iframe that hosts the Walla widget
   const iframeEl = await page.waitForSelector('iframe[src*="widget.hellowalla.com"]', { timeout: 45000 });
   const frame = await iframeEl.contentFrame();
   if (!frame) throw new Error('widget_frame_not_ready');
@@ -113,8 +119,8 @@ app.get('/capture-schedule', async (req, res) => {
         });
       }
 
-      // Wait for the widget iframe and give it a moment to render classes
       const frame = await getWidgetFrame(page);
+
       // Scroll through the frame to trigger any lazy loads
       await frame.evaluate(async () => {
         const sleep = (ms) => new Promise(r => setTimeout(r, ms));
@@ -125,10 +131,8 @@ app.get('/capture-schedule', async (req, res) => {
         window.scrollTo(0, 0);
       });
 
-      // Optionally wait a beat for badges/buttons to paint
       await page.waitForTimeout(delayMs);
 
-      // Screenshot either the whole page or just the widget frame body
       if (fullPage) {
         return await page.screenshot({ type: 'png', fullPage: true });
       } else {
@@ -136,6 +140,11 @@ app.get('/capture-schedule', async (req, res) => {
       }
     }, { dpr });
 
+    // no caching anywhere; delivered inline; nothing saved server-side
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+    res.setHeader('Content-Disposition', 'inline; filename="schedule.png"');
     res.setHeader('Content-Type', 'image/png');
     return res.status(200).send(pngBuffer);
   } catch (e) {
@@ -144,7 +153,7 @@ app.get('/capture-schedule', async (req, res) => {
   }
 });
 
-// ---------- Route: capture TEXT from the widget (no OCR) ----------
+// ---------- Route: capture TEXT + structured rows from the widget (no PNG needed) ----------
 // GET /capture-schedule-text?start=YYYY-MM-DD&end=YYYY-MM-DD[&url=...]
 app.get('/capture-schedule-text', async (req, res) => {
   const startISO = toISO(req.query.start);
@@ -164,37 +173,110 @@ app.get('/capture-schedule-text', async (req, res) => {
         });
       }
 
-      // Grab innerText from the iframe
-      const frame = await getWidgetFrame(page);
+      const frameEl = await page.waitForSelector('iframe[src*="widget.hellowalla.com"]', { timeout: 45000 });
+      const frame = await frameEl.contentFrame();
+      if (!frame) throw new Error('widget_frame_not_ready');
 
-      // Best-effort wait for any "SPOT(S)" or "Waitlist" text to appear
+      // Give the widget a moment to render
       await frame.waitForTimeout(1200);
+
+      // 1) Raw text snapshot (debug)
       const text = await frame.evaluate(() => document.body.innerText || '');
 
-      // Quick heuristic parse (optional)
-      const lines = text.split('\n').map(s => s.trim()).filter(Boolean);
-      const timeRe = /\b([0-1]?\d:[0-5]\d)\s*([AP]M)\b/i;
-      const rows = [];
-      for (let i = 0; i < lines.length; i++) {
-        const L = lines[i];
-        const timeMatch = L.match(timeRe);
-        const spotsMatch = L.match(/\b(\d+)\s*SPOTS?\b/i);
-        const waitlist = /waitlist/i.test(L);
-        const full = /sold\s*out|full/i.test(L);
+      // 2) Structured parse directly from DOM
+      const rows = await frame.evaluate((defaultDate) => {
+        const out = [];
+        const qAll = (sel, root = document) => Array.from(root.querySelectorAll(sel));
+        const txt  = (el) => (el?.innerText || '').trim();
 
-        if (timeMatch || spotsMatch || waitlist || full) {
-          // Look around this line for a plausible class name
-          const context = [lines[i-2], lines[i-1], L, lines[i+1], lines[i+2]].filter(Boolean).join(' | ');
-          rows.push({
-            date: startISO,
-            time: timeMatch ? `${timeMatch[1]} ${timeMatch[2].toUpperCase()}` : '',
-            class_name: context.split('|')[0]?.trim() || '',
-            open_spots: spotsMatch ? parseInt(spotsMatch[1], 10) : (waitlist || full ? 0 : null),
-            status: waitlist ? 'waitlist' : (full ? 'full' : (spotsMatch ? (parseInt(spotsMatch[1],10)>0 ? 'open' : 'full') : 'unknown')),
-            raw: L
-          });
+        // Class "rows" — wide net, filter by presence of time
+        const candidates = qAll('[data-testid="class-row"], .class-row, .schedule-row, .class-item, li, tr, .row')
+          .filter(el => (el && txt(el).length > 0));
+
+        const TIME_RE  = /\b([0-1]?\d:[0-5]\d)\s*([AP]M)\b/i;
+        const SPOTS_RE = /\b(\d+)\s*SPOTS?\b/i;
+        const IGNORE_NAME_RE = /^(EDT|[\d]+\s*min|In-?Person|Book|map|Log In|Daily|Weekly|List|Filter by|Type|Location|Instructor|Name|Category|All|The Pearl(?: Pilates Haven)?|Drop-in:|\$[\d.,]+|TIME\s+CLASS)$/i;
+
+        function isCandidateName(s) {
+          if (!s || s.length < 3) return false;
+          if (TIME_RE.test(s)) return false;
+          if (IGNORE_NAME_RE.test(s)) return false;
+          if (/^Waitlist$/i.test(s)) return false;
+          if (/^Sold\s*Out$/i.test(s)) return false;
+          if (/^Full$/i.test(s)) return false;
+          return true;
         }
-      }
+
+        for (const row of candidates) {
+          const rowText = txt(row);
+          const tm = rowText.match(TIME_RE);
+          const time = tm ? `${tm[1]} ${tm[2].toUpperCase()}` : '';
+          if (!time) continue;
+
+          // Prefer explicit title nodes
+          let class_name = '';
+          const nameEl = row.querySelector('a, .class-title, [data-testid="class-name"], h3, h4, [role="heading"]');
+          if (nameEl) class_name = txt(nameEl);
+
+          // Fallback: scan nearby lines
+          if (!class_name) {
+            const parts = rowText.split('\n').map(s => s.trim()).filter(Boolean);
+            for (const p of parts) { if (isCandidateName(p)) { class_name = p; break; } }
+          }
+
+          // Instructor (e.g., "w/ Ana Maria")
+          let instructor = '';
+          const im = rowText.match(/w\/\s*([A-Za-z][A-Za-z .'-]+)/i);
+          if (im) instructor = im[1].trim();
+
+          // Spots badge or button text
+          const badges = qAll('span, div, button', row).map(txt);
+          const spotsLabel = badges.find(t => SPOTS_RE.test(t));
+          const btnText    = badges.find(t => /book|waitlist|sold\s*out|full/i.test(t)) || '';
+
+          let open_spots = null;
+          let status = 'unknown';
+
+          if (spotsLabel) {
+            const m = spotsLabel.match(SPOTS_RE);
+            open_spots = m ? parseInt(m[1], 10) : 0;
+            status = open_spots > 0 ? 'open' : 'full';
+          }
+          if (/waitlist/i.test(btnText) || /waitlist/i.test(rowText)) {
+            status = 'waitlist';
+            if (open_spots === null) open_spots = 0;
+          } else if (/sold\s*out|^full$/i.test(btnText)) {
+            status = 'full';
+            if (open_spots === null) open_spots = 0;
+          } else if (/book/i.test(btnText) && open_spots === null) {
+            // "Book" with no numeric badge -> open, unknown count (null)
+            status = 'open';
+            open_spots = null;
+          }
+
+          if (time && (class_name || status !== 'unknown')) {
+            out.push({
+              date: defaultDate || '',
+              time,
+              class_name: class_name || '',
+              instructor: instructor || '',
+              status,
+              open_spots, // number | null
+            });
+          }
+        }
+
+        // Deduplicate by date|time|class_name
+        const seen = new Set();
+        const dedup = [];
+        for (const r of out) {
+          const key = `${r.date}|${r.time}|${r.class_name}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          dedup.push(r);
+        }
+        return dedup;
+      }, startISO);
 
       return { text, parsed: rows };
     });
