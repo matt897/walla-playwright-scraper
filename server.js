@@ -1,6 +1,7 @@
 // server.js
-// Run with: node server.js
-// One-time setup (in your image or host): npx playwright install --with-deps
+// Run: node server.js
+// One-time: npx playwright install --with-deps
+// package.json should include: { "type": "module" }  (ESM)
 
 import express from 'express';
 import cors from 'cors';
@@ -22,7 +23,7 @@ app.use((req, res, next) => {
   return res.status(401).json({ error: 'unauthorized' });
 });
 
-// ---------- Configurable widget identity (envs optional) ----------
+// ---------- Widget identity (envs optional) ----------
 const WALLA_UUID = process.env.WALLA_UUID || '3f4c5689-8468-47d5-a722-c0ab605b2da4';
 const WALLA_LOCATION_ID = process.env.WALLA_LOCATION_ID || '3589';
 
@@ -76,7 +77,7 @@ async function withBrowser(fn, { dpr = 2 } = {}) {
     const page = await context.newPage();
     await page.setViewportSize({ width: 1360, height: 1800 });
 
-    // Block common trackers that keep long connections open
+    // Block noisy trackers that keep long connections open
     await page.route('**/*', (route) => {
       const u = route.request().url();
       if (/\b(googletagmanager|google-analytics|doubleclick|hotjar|facebook|segment|sentry|intercom|hs-scripts)\b/i.test(u)) {
@@ -91,15 +92,26 @@ async function withBrowser(fn, { dpr = 2 } = {}) {
   }
 }
 
-async function getWidgetFrame(page) {
-  const iframeEl = await page.waitForSelector('iframe[src*="widget.hellowalla.com"]', { timeout: 45000 });
-  const frame = await iframeEl.contentFrame();
-  if (!frame) throw new Error('widget_frame_not_ready');
-  return { iframeEl, frame };
+// Finds the widget by scanning all frames’ URLs
+async function getWallaFrameByScan(page, { timeoutMs = 45000 } = {}) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const f = page.frames().find(fr => /widget\.hellowalla\.com/i.test(fr.url()));
+    if (f) return f;
+    await page.waitForTimeout(250);
+  }
+  throw new Error('widget_frame_not_ready');
 }
 
-// ---------- PNG capture (optional, for audits/OCR) ----------
-// GET /capture-schedule?start=YYYY-MM-DD&end=YYYY-MM-DD[&url=...][&dpr=2][&delay=1500][&fullPage=0]
+async function debugDump(page) {
+  const frames = page.frames().map(fr => fr.url());
+  const title = await page.title().catch(() => '');
+  const topHtml = await page.content().catch(() => '');
+  return { frames, title, top_snippet: topHtml.slice(0, 2000) };
+}
+
+// ---------- PNG capture (optional) ----------
+// GET /capture-schedule?start=YYYY-MM-DD&end=YYYY-MM-DD[&url=...][&dpr=2][&delay=1500][&fullPage=0][&debug=1]
 app.get('/capture-schedule', async (req, res) => {
   const startISO = toISO(req.query.start);
   const endISO   = toISO(req.query.end);
@@ -107,6 +119,7 @@ app.get('/capture-schedule', async (req, res) => {
   const delayMs  = Number(req.query.delay || 1500);
   const fullPage = String(req.query.fullPage || '0') === '1';
   const referer  = String(req.query.url || '');
+  const debug    = String(req.query.debug || '0') === '1';
 
   try {
     const pngBuffer = await withBrowser(async ({ page }) => {
@@ -120,19 +133,10 @@ app.get('/capture-schedule', async (req, res) => {
         });
       }
 
-      const { frame } = await getWidgetFrame(page);
-
-      // Lazy-load guard: scroll the frame a bit
-      await frame.evaluate(async () => {
-        const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-        for (let i = 0; i < 4; i++) {
-          window.scrollTo(0, document.body.scrollHeight);
-          await sleep(200);
-        }
-        window.scrollTo(0, 0);
-      });
-
+      // Scroll a bit to trigger lazy paints even if we don't parse here
       await page.waitForTimeout(delayMs);
+
+      const frame = await getWallaFrameByScan(page, { timeoutMs: 45000 });
 
       return fullPage
         ? await page.screenshot({ type: 'png', fullPage: true })
@@ -147,16 +151,31 @@ app.get('/capture-schedule', async (req, res) => {
     return res.status(200).send(pngBuffer);
   } catch (e) {
     console.error('capture-schedule failed:', e);
+    if (String(req.query.debug || '0') === '1') {
+      // Return debug info with 200
+      try {
+        const dbg = await withBrowser(async ({ page }) => {
+          if (referer) {
+            await page.goto(referer, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(()=>{});
+          } else {
+            await page.setContent(LOCAL_HTML({ start: startISO, end: endISO }), { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(()=>{});
+          }
+          return await debugDump(page);
+        });
+        return res.json({ error: 'capture_failed', details: String(e), debug: dbg });
+      } catch {}
+    }
     return res.status(500).json({ error: 'capture_failed', details: String(e) });
   }
 });
 
-// ---------- Text + structured rows (forces iframe date) ----------
-// GET /capture-schedule-text?start=YYYY-MM-DD&end=YYYY-MM-DD[&url=...]
+// ---------- Text + structured rows (forces frame date) ----------
+// GET /capture-schedule-text?start=YYYY-MM-DD&end=YYYY-MM-DD[&url=...][&debug=1]
 app.get('/capture-schedule-text', async (req, res) => {
   const startISO = toISO(req.query.start);
   const endISO   = toISO(req.query.end);
   const referer  = String(req.query.url || '');
+  const debug    = String(req.query.debug || '0') === '1';
 
   try {
     const out = await withBrowser(async ({ page }) => {
@@ -171,40 +190,34 @@ app.get('/capture-schedule-text', async (req, res) => {
         });
       }
 
-      // Find widget iframe
-      const { iframeEl, frame: initialFrame } = await getWidgetFrame(page);
-      let frame = initialFrame;
+      // Find widget frame by URL scan (more reliable)
+      let frame = await getWallaFrameByScan(page, { timeoutMs: 45000 });
 
-      // --- HARD-SET start/end on iframe src (forces the correct day) ---
-      const changed = await page.evaluate((isoStart, isoEnd) => {
-        const f = document.querySelector('iframe[src*="widget.hellowalla.com"]');
-        if (!f) return { changed: false, url: null };
-        try {
-          const u = new URL(f.src, location.href);
-          let mutated = false;
-          if (isoStart && u.searchParams.get('start') !== isoStart) { u.searchParams.set('start', isoStart); mutated = true; }
-          if (isoEnd   && u.searchParams.get('end')   !== isoEnd)   { u.searchParams.set('end', isoEnd);     mutated = true; }
-          if (mutated) f.src = u.toString();
-          return { changed: mutated, url: u.toString() };
-        } catch (e) {
-          return { changed: false, url: null, error: String(e) };
-        }
-      }, startISO, endISO);
+      // --- Force the requested date by rewriting frame location from inside the frame ---
+      try {
+        await frame.evaluate(([isoStart, isoEnd]) => {
+          try {
+            const u = new URL(window.location.href);
+            if (isoStart) u.searchParams.set('start', isoStart);
+            if (isoEnd)   u.searchParams.set('end', isoEnd);
+            if (u.toString() !== window.location.href) {
+              window.location.replace(u.toString());
+            }
+          } catch (e) { /* ignore; we'll still try to parse */ }
+        }, [startISO, endISO]);
 
-      if (changed.changed) {
-        // Wait a moment for the iframe to reload to the new date
+        // Wait a beat for reload; reacquire frame if its identity changed
         await page.waitForTimeout(1200);
-        frame = await iframeEl.contentFrame();
-        await page.waitForTimeout(600);
+        frame = await getWallaFrameByScan(page, { timeoutMs: 20000 });
+        await page.waitForTimeout(800);
+      } catch (e) {
+        // If we couldn't rewrite, continue with whatever is loaded
       }
 
-      // Let UI paint
-      await frame.waitForTimeout(1200);
-
       // 1) Raw text snapshot (debug aid)
-      const text = await frame.evaluate(() => document.body.innerText || '');
+      const text = await frame.evaluate(() => document.body.innerText || '').catch(() => '');
 
-      // 2) Structured parse directly from DOM
+      // 2) Structured parse from DOM
       const rows = await frame.evaluate((defaultDate) => {
         const out = [];
         const qAll = (sel, root = document) => Array.from(root.querySelectorAll(sel));
@@ -294,14 +307,28 @@ app.get('/capture-schedule-text', async (req, res) => {
           dedup.push(r);
         }
         return dedup;
-      }, startISO);
+      }, startISO).catch(() => []);
 
-      return { text, parsed: rows };
+      return { text, parsed: rows, frames: page.frames().map(fr => fr.url()) };
     });
 
     return res.json({ start: startISO, end: endISO, ...out });
   } catch (e) {
     console.error('capture-schedule-text failed:', e);
+    if (debug) {
+      // Return debug info with 200 (so jq pipelines don't crash)
+      try {
+        const dbg = await withBrowser(async ({ page }) => {
+          if (referer) {
+            await page.goto(referer, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(()=>{});
+          } else {
+            await page.setContent(LOCAL_HTML({ start: startISO, end: endISO }), { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(()=>{});
+          }
+          return await debugDump(page);
+        });
+        return res.json({ error: 'text_capture_failed', details: String(e), debug: dbg });
+      } catch {}
+    }
     return res.status(500).json({ error: 'text_capture_failed', details: String(e) });
   }
 });
