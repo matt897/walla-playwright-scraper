@@ -1,7 +1,7 @@
 // server.js
 // Run: node server.js
 // One-time: npx playwright install --with-deps
-// package.json should include: { "type": "module" }  (ESM)
+// Ensure package.json has: { "type": "module" }  (ESM)
 
 import express from 'express';
 import cors from 'cors';
@@ -92,7 +92,7 @@ async function withBrowser(fn, { dpr = 2 } = {}) {
   }
 }
 
-// Finds the widget by scanning all frames’ URLs
+// Find the widget by scanning all frames’ URLs
 async function getWallaFrameByScan(page, { timeoutMs = 45000 } = {}) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
@@ -110,7 +110,7 @@ async function debugDump(page) {
   return { frames, title, top_snippet: topHtml.slice(0, 2000) };
 }
 
-// ---------- PNG capture (optional) ----------
+// ---------- PNG capture (optional, for audits/OCR) ----------
 // GET /capture-schedule?start=YYYY-MM-DD&end=YYYY-MM-DD[&url=...][&dpr=2][&delay=1500][&fullPage=0][&debug=1]
 app.get('/capture-schedule', async (req, res) => {
   const startISO = toISO(req.query.start);
@@ -119,7 +119,6 @@ app.get('/capture-schedule', async (req, res) => {
   const delayMs  = Number(req.query.delay || 1500);
   const fullPage = String(req.query.fullPage || '0') === '1';
   const referer  = String(req.query.url || '');
-  const debug    = String(req.query.debug || '0') === '1';
 
   try {
     const pngBuffer = await withBrowser(async ({ page }) => {
@@ -133,9 +132,7 @@ app.get('/capture-schedule', async (req, res) => {
         });
       }
 
-      // Scroll a bit to trigger lazy paints even if we don't parse here
-      await page.waitForTimeout(delayMs);
-
+      await page.waitForTimeout(delayMs); // let things paint
       const frame = await getWallaFrameByScan(page, { timeoutMs: 45000 });
 
       return fullPage
@@ -152,7 +149,6 @@ app.get('/capture-schedule', async (req, res) => {
   } catch (e) {
     console.error('capture-schedule failed:', e);
     if (String(req.query.debug || '0') === '1') {
-      // Return debug info with 200
       try {
         const dbg = await withBrowser(async ({ page }) => {
           if (referer) {
@@ -169,7 +165,7 @@ app.get('/capture-schedule', async (req, res) => {
   }
 });
 
-// ---------- Text + structured rows (forces frame date) ----------
+// ---------- Text + structured rows (locks to requested day section) ----------
 // GET /capture-schedule-text?start=YYYY-MM-DD&end=YYYY-MM-DD[&url=...][&debug=1]
 app.get('/capture-schedule-text', async (req, res) => {
   const startISO = toISO(req.query.start);
@@ -179,7 +175,7 @@ app.get('/capture-schedule-text', async (req, res) => {
 
   try {
     const out = await withBrowser(async ({ page }) => {
-      // Navigate real page or use local shell
+      // 1) Load real page or local shell
       if (referer) {
         await page.goto(referer, { waitUntil: 'domcontentloaded', timeout: 120000 });
         await page.waitForLoadState('load', { timeout: 15000 }).catch(() => {});
@@ -190,10 +186,10 @@ app.get('/capture-schedule-text', async (req, res) => {
         });
       }
 
-      // Find widget frame by URL scan (more reliable)
+      // 2) Find widget frame by URL
       let frame = await getWallaFrameByScan(page, { timeoutMs: 45000 });
 
-      // --- Force the requested date by rewriting frame location from inside the frame ---
+      // 3) Force the frame's location to include start/end (inside the frame)
       try {
         await frame.evaluate(([isoStart, isoEnd]) => {
           try {
@@ -203,28 +199,88 @@ app.get('/capture-schedule-text', async (req, res) => {
             if (u.toString() !== window.location.href) {
               window.location.replace(u.toString());
             }
-          } catch (e) { /* ignore; we'll still try to parse */ }
+          } catch {}
         }, [startISO, endISO]);
 
-        // Wait a beat for reload; reacquire frame if its identity changed
         await page.waitForTimeout(1200);
         frame = await getWallaFrameByScan(page, { timeoutMs: 20000 });
         await page.waitForTimeout(800);
-      } catch (e) {
-        // If we couldn't rewrite, continue with whatever is loaded
-      }
+      } catch {}
 
-      // 1) Raw text snapshot (debug aid)
+      // 4) Try to ensure the proper day view is active: click "Daily" and the target day tab.
+      await frame.evaluate((iso) => {
+        const d = new Date(iso + 'T12:00:00');
+        const dowShort = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][d.getUTCDay()];
+        const dowLong  = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'][d.getUTCDay()];
+        const monShort = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][d.getUTCMonth()];
+        const day      = d.getUTCDate();
+
+        const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
+
+        // Try "Daily"
+        const dailyBtn = Array.from(document.querySelectorAll('button,[role=tab],a,[role=button]'))
+          .find(el => /^daily$/i.test(norm(el.innerText || el.textContent || '')));
+        if (dailyBtn) dailyBtn.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+
+        // Try clicking the target day tab (several label variants)
+        const tabVariants = new Set([
+          `${dowShort} ${monShort} ${day}`, // "Wed Sep 3"
+          `${monShort} ${day}`,             // "Sep 3"
+          `${dowShort} ${day}`,             // "Wed 3"
+        ]);
+        const tabs = Array.from(document.querySelectorAll('button,[role=tab],a,[role=button],.tab,.day'));
+        for (const el of tabs) {
+          const t = norm(el.innerText || el.textContent || '');
+          for (const v of tabVariants) {
+            if (t.includes(v)) {
+              el.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+              break;
+            }
+          }
+        }
+        window.scrollTo(0, 0);
+      }, startISO);
+
+      await frame.waitForTimeout(800);
+
+      // 5) Text snapshot (debugging)
       const text = await frame.evaluate(() => document.body.innerText || '').catch(() => '');
 
-      // 2) Structured parse from DOM
-      const rows = await frame.evaluate((defaultDate) => {
+      // 6) Parse ONLY the requested day's section
+      const rows = await frame.evaluate((iso) => {
         const out = [];
         const qAll = (sel, root = document) => Array.from(root.querySelectorAll(sel));
         const txt  = (el) => (el?.innerText || '').trim();
+        const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
 
-        const candidates = qAll('[data-testid="class-row"], .class-row, .schedule-row, .class-item, li, tr, .row')
-          .filter(el => el && txt(el).length > 0);
+        // Build labels for the date header
+        const d = new Date(iso + 'T12:00:00');
+        const dowLong  = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'][d.getUTCDay()];
+        const monLong  = ['January','February','March','April','May','June','July','August','September','October','November','December'][d.getUTCMonth()];
+        const wantUpper = `${dowLong.toUpperCase()}, ${monLong.toUpperCase()} ${d.getUTCDate()}`;
+        const wantCap   = `${dowLong}, ${monLong} ${d.getUTCDate()}`;
+
+        // Find the header element for the requested day
+        const headers = qAll('h1,h2,h3,h4,[role=heading],.date-header,.day-header,.schedule-day-header');
+        let headerEl = headers.find(el => {
+          const t = norm(txt(el));
+          return t.includes(wantUpper) || t.includes(wantCap);
+        });
+        if (!headerEl) headerEl = headers[0];
+        if (!headerEl) return out;
+
+        // Collect nodes after headerEl until the next header
+        const dayChunks = [];
+        let cur = headerEl.nextElementSibling;
+        while (cur) {
+          const t = norm(txt(cur));
+          const isAnotherHeader =
+            /^(SUNDAY|MONDAY|TUESDAY|WEDNESDAY|THURSDAY|FRIDAY|SATURDAY),\s+[A-Z]+\s+\d{1,2}$/.test(t) ||
+            /^[A-Z][a-z]+,\s+[A-Z][a-z]+\s+\d{1,2}$/.test(t);
+          if (isAnotherHeader) break;
+          dayChunks.push(cur);
+          cur = cur.nextElementSibling;
+        }
 
         const TIME_RE  = /\b([0-1]?\d:[0-5]\d)\s*([AP]M)\b/i;
         const SPOTS_RE = /\b(\d+)\s*SPOTS?\b/i;
@@ -238,6 +294,14 @@ app.get('/capture-schedule-text', async (req, res) => {
           if (/^Sold\s*Out$/i.test(s)) return false;
           if (/^Full$/i.test(s)) return false;
           return true;
+        }
+
+        const candidates = [];
+        for (const sect of dayChunks) {
+          candidates.push(...qAll('[data-testid="class-row"], .class-row, .schedule-row, .class-item, li, tr, .row', sect));
+        }
+        if (candidates.length === 0) {
+          for (const sect of dayChunks) candidates.push(sect);
         }
 
         for (const row of candidates) {
@@ -287,7 +351,7 @@ app.get('/capture-schedule-text', async (req, res) => {
 
           if (time && (class_name || status !== 'unknown')) {
             out.push({
-              date: defaultDate || '',
+              date: iso || '',
               time,
               class_name: class_name || '',
               instructor: instructor || '',
@@ -309,26 +373,16 @@ app.get('/capture-schedule-text', async (req, res) => {
         return dedup;
       }, startISO).catch(() => []);
 
-      return { text, parsed: rows, frames: page.frames().map(fr => fr.url()) };
+      // Also report frame URLs for quick debugging
+      const frames = page.frames().map(fr => fr.url());
+
+      return { text, parsed: rows, frames };
     });
 
     return res.json({ start: startISO, end: endISO, ...out });
   } catch (e) {
     console.error('capture-schedule-text failed:', e);
-    if (debug) {
-      // Return debug info with 200 (so jq pipelines don't crash)
-      try {
-        const dbg = await withBrowser(async ({ page }) => {
-          if (referer) {
-            await page.goto(referer, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(()=>{});
-          } else {
-            await page.setContent(LOCAL_HTML({ start: startISO, end: endISO }), { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(()=>{});
-          }
-          return await debugDump(page);
-        });
-        return res.json({ error: 'text_capture_failed', details: String(e), debug: dbg });
-      } catch {}
-    }
+    if (debug) return res.json({ error: 'text_capture_failed', details: String(e) });
     return res.status(500).json({ error: 'text_capture_failed', details: String(e) });
   }
 });
