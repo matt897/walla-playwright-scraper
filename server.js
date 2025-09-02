@@ -42,7 +42,21 @@ const LOCAL_HTML = ({ start, end }) =>
   '</body></html>';
 
 // ---------- Helpers ----------
-const toISO = (v) => (v || '').toString().slice(0, 10);
+// Extract a YYYY-MM-DD anywhere in the input (handles "=2025-09-03" too)
+function pickISO(v) {
+  if (!v) return '';
+  const m = String(v).match(/(\d{4}-\d{2}-\d{2})/);
+  return m ? m[1] : '';
+}
+const clampISO = (v) => pickISO(v);
+
+// Safer year extraction (fallback to NY current year)
+function yearFromISO(iso) {
+  const y = Number((iso || '').slice(0, 4));
+  if (Number.isFinite(y) && y >= 1900 && y <= 3000) return y;
+  const now = new Date().toLocaleString('en-US', { timeZone: 'America/New_York' });
+  return new Date(now).getFullYear();
+}
 
 async function withBrowser(fn, { dpr = 2 } = {}) {
   const browser = await chromium.launch({
@@ -100,18 +114,17 @@ async function getWallaFrameByScan(page, { timeoutMs = 45000 } = {}) {
 
 // -------- Visible date extraction inside iframe --------
 async function extractVisibleDateISO(frame, targetYear) {
-  // Parse headers like: "TUESDAY, SEPTEMBER 2" or "Tuesday, September 2"
   return await frame.evaluate((year) => {
     const MONTHS = {
       JANUARY:1,FEBRUARY:2,MARCH:3,APRIL:4,MAY:5,JUNE:6,JULY:7,AUGUST:8,SEPTEMBER:9,OCTOBER:10,NOVEMBER:11,DECEMBER:12
     };
     function norm(s){ return (s||'').replace(/\s+/g,' ').trim(); }
 
-    const all = Array.from(document.querySelectorAll('h1,h2,h3,h4,[role=heading],.date-header,.day-header,.schedule-day-header, .walla-date, .day-title'))
+    const headers = Array.from(document.querySelectorAll('h1,h2,h3,h4,[role=heading],.date-header,.day-header,.schedule-day-header,.walla-date,.day-title'))
       .map(el => norm(el.innerText||el.textContent||''))
       .filter(Boolean);
 
-    for (const t of all) {
+    for (const t of headers) {
       const m = t.match(/^(?:SUNDAY|MONDAY|TUESDAY|WEDNESDAY|THURSDAY|FRIDAY|SATURDAY),?\s+([A-Z]+)\s+(\d{1,2})$/i);
       if (m) {
         const monthName = m[1].toUpperCase();
@@ -124,7 +137,7 @@ async function extractVisibleDateISO(frame, targetYear) {
         }
       }
     }
-    // Fallback: try body text scan (cheap)
+    // Fallback scan of body text
     const body = norm(document.body.innerText||'');
     const m2 = body.match(/(?:SUNDAY|MONDAY|TUESDAY|WEDNESDAY|THURSDAY|FRIDAY|SATURDAY),?\s+([A-Z]+)\s+(\d{1,2})/i);
     if (m2) {
@@ -142,11 +155,9 @@ async function extractVisibleDateISO(frame, targetYear) {
   }, targetYear);
 }
 
-// -------- Try to switch the iframe to the requested date --------
 async function ensureDay(frame, startISO) {
-  // Click "Daily" and the tab for the target day (Mon Sep 3, etc.)
   await frame.evaluate((iso) => {
-    const d = new Date(iso + 'T12:00:00'); // local TZ in context
+    const d = new Date(iso + 'T12:00:00');
     const dowShort = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][d.getDay()];
     const monShort = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][d.getMonth()];
     const day = d.getDate();
@@ -171,11 +182,10 @@ async function ensureDay(frame, startISO) {
   }, startISO).catch(()=>{});
 }
 
-// -------- Plain-text fallback parser (with price) --------
+// -------- Plain-text fallback parser (with price), stamped with visible date --------
 function parseFromPlainText(text, visibleISO) {
   if (!text) return [];
 
-  // visibleISO is what we'll stamp rows with
   const d = new Date(visibleISO + 'T12:00:00Z');
   const dowLong = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'][d.getUTCDay()];
   const monLong = ['January','February','March','April','May','June','July','August','September','October','November','December'][d.getUTCMonth()];
@@ -279,8 +289,8 @@ function parseFromPlainText(text, visibleISO) {
 
 // ---------- PNG capture ----------
 app.get('/capture-schedule', async (req, res) => {
-  const startISO = toISO(req.query.start);
-  const endISO   = toISO(req.query.end);
+  const startISO = clampISO(req.query.start);
+  const endISO   = clampISO(req.query.end);
   const dpr      = Number(req.query.dpr || 2);
   const delayMs  = Number(req.query.delay || 1500);
   const fullPage = String(req.query.fullPage || '0') === '1';
@@ -316,15 +326,16 @@ app.get('/capture-schedule', async (req, res) => {
 
 // ---------- Text + structured rows (date-correct, with price) ----------
 app.get('/capture-schedule-text', async (req, res) => {
-  const startISO = toISO(req.query.start);
-  const endISO   = toISO(req.query.end);
+  const rawStart = req.query.start;
+  const rawEnd   = req.query.end;
+  const startISO = clampISO(rawStart);
+  const endISO   = clampISO(rawEnd);
   const referer  = String(req.query.url || '');
   const debug    = String(req.query.debug || '0') === '1';
   const delayMs  = Number(req.query.delay || 1800);
 
   try {
     const result = await withBrowser(async ({ page }) => {
-      // Load page or local shell
       if (referer) {
         await page.goto(referer, { waitUntil: 'domcontentloaded', timeout: 120000 });
         await page.waitForLoadState('load', { timeout: 15000 }).catch(() => {});
@@ -332,10 +343,9 @@ app.get('/capture-schedule-text', async (req, res) => {
         await page.setContent(LOCAL_HTML({ start: startISO, end: endISO }), { waitUntil: 'domcontentloaded', timeout: 60000 });
       }
 
-      // Find widget frame
       let frame = await getWallaFrameByScan(page, { timeoutMs: 45000 });
 
-      // Force frame to start/end in URL (widget respects these)
+      // Force URL params in iframe
       try {
         await frame.evaluate(([isoStart, isoEnd]) => {
           try {
@@ -350,27 +360,24 @@ app.get('/capture-schedule-text', async (req, res) => {
         frame = await getWallaFrameByScan(page, { timeoutMs: 20000 });
       } catch {}
 
-      // Try to move to correct day via UI controls
-      await ensureDay(frame, startISO).catch(()=>{});
+      // Try UI navigation to the desired day
+      if (startISO) await ensureDay(frame, startISO).catch(()=>{});
 
-      // Wait for content to settle
+      // Wait for content
       await frame.waitForTimeout(delayMs);
       await frame.waitForFunction(() => {
         const t = (document.body.innerText || '').trim();
         return /\b([0-1]?\d:[0-5]\d)\s*(AM|PM)\b/i.test(t) || /Book|Waitlist|Sold\s*Out|Full/i.test(t);
       }, { timeout: 20000 }).catch(()=>{});
 
-      // Determine the visible date the widget is actually showing
-      const targetYear = new Date(startISO + 'T00:00:00').getFullYear();
+      const targetYear = yearFromISO(startISO);
       let visibleISO = await extractVisibleDateISO(frame, targetYear);
-      if (!visibleISO) visibleISO = startISO; // fallback if header not found
+      if (!visibleISO) visibleISO = startISO || visibleISO;
 
-      const day_mismatch = visibleISO !== startISO;
+      const day_mismatch = !!(startISO && visibleISO && visibleISO !== startISO);
 
-      // Grab text for fallback/debug
       const text = await frame.evaluate(() => document.body.innerText || '').catch(() => '');
 
-      // ---------- DOM parser (global) ----------
       const parsedDom = await frame.evaluate((visibleISO) => {
         const out = [];
         const qAll = (sel, r = document) => Array.from(r.querySelectorAll(sel));
@@ -427,7 +434,6 @@ app.get('/capture-schedule-text', async (req, res) => {
         return dedup;
       }, visibleISO).catch(() => []);
 
-      // If DOM parse failed, try plain text (stamped with visibleISO)
       let parse_mode = 'global-dom';
       let parsed = parsedDom;
       if (!parsed || parsed.length === 0) {
@@ -438,8 +444,10 @@ app.get('/capture-schedule-text', async (req, res) => {
       return {
         parsed,
         parse_mode,
-        visible_date_iso: visibleISO,
+        visible_date_iso: visibleISO || null,
         day_mismatch,
+        _debug_rawStart: rawStart,
+        _debug_rawEnd: rawEnd,
         text: debug ? text : undefined,
         frames: debug ? page.frames().map(fr => fr.url()) : undefined
       };
@@ -452,6 +460,9 @@ app.get('/capture-schedule-text', async (req, res) => {
       visible_date_iso: result.visible_date_iso || null,
       day_mismatch: !!result.day_mismatch,
       parsed: result.parsed || [],
+      // Uncomment for troubleshooting:
+      // _debug_rawStart: result._debug_rawStart,
+      // _debug_rawEnd: result._debug_rawEnd,
       ...(debug ? { text: result.text || '', frames: result.frames || [] } : {}),
     });
   } catch (e) {
