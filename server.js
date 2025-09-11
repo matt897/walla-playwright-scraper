@@ -1,7 +1,7 @@
 // server.js
 // Run: node server.js
 // One-time: npx playwright install --with-deps
-// package.json -> { "type": "module" }
+// package.json should include: { "type": "module" }
 
 import express from 'express';
 import cors from 'cors';
@@ -14,7 +14,7 @@ app.use(express.json({ limit: '1mb' }));
 // ---------- Health ----------
 app.get('/healthz', (_req, res) => res.send('ok'));
 
-// ---------- Auth ----------
+// ---------- Auth (optional via SCRAPER_TOKEN) ----------
 app.use((req, res, next) => {
   const AUTH_TOKEN = process.env.SCRAPER_TOKEN || '';
   if (!AUTH_TOKEN) return next();
@@ -27,7 +27,7 @@ app.use((req, res, next) => {
 const WALLA_UUID = process.env.WALLA_UUID || '3f4c5689-8468-47d5-a722-c0ab605b2da4';
 const WALLA_LOCATION_ID = process.env.WALLA_LOCATION_ID || '3589';
 
-// ---------- Local HTML shell ----------
+// ---------- Local HTML shell to host the widget ----------
 const LOCAL_HTML = ({ start, end }) =>
   '<!doctype html><html><head><meta charset="utf-8"/></head><body>' +
   '<div class="walla-widget-root" ' +
@@ -42,21 +42,11 @@ const LOCAL_HTML = ({ start, end }) =>
   '</body></html>';
 
 // ---------- Helpers ----------
-// Extract a YYYY-MM-DD anywhere in the input (handles "=2025-09-03" too)
-function pickISO(v) {
-  if (!v) return '';
-  const m = String(v).match(/(\d{4}-\d{2}-\d{2})/);
+const pickISO = (v) => {
+  const m = String(v || '').match(/(\d{4}-\d{2}-\d{2})/);
   return m ? m[1] : '';
-}
-const clampISO = (v) => pickISO(v);
-
-// Safer year extraction (fallback to NY current year)
-function yearFromISO(iso) {
-  const y = Number((iso || '').slice(0, 4));
-  if (Number.isFinite(y) && y >= 1900 && y <= 3000) return y;
-  const now = new Date().toLocaleString('en-US', { timeZone: 'America/New_York' });
-  return new Date(now).getFullYear();
-}
+};
+const toISO = (v) => pickISO(v);
 
 async function withBrowser(fn, { dpr = 2 } = {}) {
   const browser = await chromium.launch({
@@ -87,7 +77,7 @@ async function withBrowser(fn, { dpr = 2 } = {}) {
     const page = await context.newPage();
     await page.setViewportSize({ width: 1360, height: 1800 });
 
-    // Block trackers that hold long connections
+    // Block some trackers that keep long connections
     await page.route('**/*', (route) => {
       const u = route.request().url();
       if (/\b(googletagmanager|google-analytics|doubleclick|hotjar|facebook|segment|sentry|intercom|hs-scripts)\b/i.test(u)) {
@@ -107,14 +97,26 @@ async function getWallaFrameByScan(page, { timeoutMs = 45000 } = {}) {
   while (Date.now() - start < timeoutMs) {
     const f = page.frames().find(fr => /widget\.hellowalla\.com/i.test(fr.url()));
     if (f) return f;
-    await page.waitForTimeout(250);
+    await page.waitForTimeout(200);
   }
   throw new Error('widget_frame_not_ready');
 }
 
-// -------- Visible date extraction inside iframe --------
+// -------- Visible date extraction (trust iframe URL first) --------
 async function extractVisibleDateISO(frame, targetYear) {
   return await frame.evaluate((year) => {
+    const pickISO = (v) => {
+      const m = String(v || '').match(/(\d{4}-\d{2}-\d{2})/);
+      return m ? m[1] : null;
+    };
+    // 1) Canonical: iframe URL ?start=YYYY-MM-DD
+    try {
+      const u = new URL(location.href);
+      const s = pickISO(u.searchParams.get('start'));
+      if (s) return s;
+    } catch {}
+
+    // 2) Fallback: scan headings/body like "WEDNESDAY, SEPTEMBER 3"
     const MONTHS = {
       JANUARY:1,FEBRUARY:2,MARCH:3,APRIL:4,MAY:5,JUNE:6,JULY:7,AUGUST:8,SEPTEMBER:9,OCTOBER:10,NOVEMBER:11,DECEMBER:12
     };
@@ -127,9 +129,10 @@ async function extractVisibleDateISO(frame, targetYear) {
     for (const t of headers) {
       const m = t.match(/^(?:SUNDAY|MONDAY|TUESDAY|WEDNESDAY|THURSDAY|FRIDAY|SATURDAY),?\s+([A-Z]+)\s+(\d{1,2})$/i);
       if (m) {
+        const map = MONTHS;
         const monthName = m[1].toUpperCase();
         const day = parseInt(m[2],10);
-        const month = MONTHS[monthName];
+        const month = map[monthName];
         if (month && day >= 1 && day <= 31) {
           const mm = String(month).padStart(2,'0');
           const dd = String(day).padStart(2,'0');
@@ -137,14 +140,13 @@ async function extractVisibleDateISO(frame, targetYear) {
         }
       }
     }
-    // Fallback scan of body text
     const body = norm(document.body.innerText||'');
     const m2 = body.match(/(?:SUNDAY|MONDAY|TUESDAY|WEDNESDAY|THURSDAY|FRIDAY|SATURDAY),?\s+([A-Z]+)\s+(\d{1,2})/i);
     if (m2) {
-      const MONTHS2 = MONTHS;
+      const map = MONTHS;
       const monthName = m2[1].toUpperCase();
       const day = parseInt(m2[2],10);
-      const month = MONTHS2[monthName];
+      const month = map[monthName];
       if (month && day>=1 && day<=31) {
         const mm = String(month).padStart(2,'0');
         const dd = String(day).padStart(2,'0');
@@ -152,41 +154,14 @@ async function extractVisibleDateISO(frame, targetYear) {
       }
     }
     return null;
-  }, targetYear);
+  }, (new Date().getFullYear()));
 }
 
-async function ensureDay(frame, startISO) {
-  await frame.evaluate((iso) => {
-    const d = new Date(iso + 'T12:00:00');
-    const dowShort = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][d.getDay()];
-    const monShort = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][d.getMonth()];
-    const day = d.getDate();
-    const norm = (s) => (s||'').replace(/\s+/g,' ').trim();
-
-    const dailyBtn = Array.from(document.querySelectorAll('button,[role=tab],a,[role=button]'))
-      .find(el => /^daily$/i.test(norm(el.innerText||el.textContent||'')));
-    if (dailyBtn) dailyBtn.dispatchEvent(new MouseEvent('click',{bubbles:true}));
-
-    const tabVariants = new Set([`${dowShort} ${monShort} ${day}`, `${monShort} ${day}`, `${dowShort} ${day}`]);
-    const tabs = Array.from(document.querySelectorAll('button,[role=tab],a,[role=button],.tab,.day'));
-    for (const el of tabs) {
-      const t = norm(el.innerText||el.textContent||'');
-      for (const v of tabVariants) {
-        if (t.includes(v)) {
-          el.dispatchEvent(new MouseEvent('click',{bubbles:true}));
-          return;
-        }
-      }
-    }
-    window.scrollTo(0,0);
-  }, startISO).catch(()=>{});
-}
-
-// -------- Plain-text fallback parser (with price), stamped with visible date --------
-function parseFromPlainText(text, visibleISO) {
+// -------- Plain-text (day-scoped) parser with price & spots --------
+function parseFromPlainText(text, iso) {
   if (!text) return [];
 
-  const d = new Date(visibleISO + 'T12:00:00Z');
+  const d = new Date(iso + 'T12:00:00Z');
   const dowLong = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'][d.getUTCDay()];
   const monLong = ['January','February','March','April','May','June','July','August','September','October','November','December'][d.getUTCMonth()];
   const monShort = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][d.getUTCMonth()];
@@ -230,7 +205,7 @@ function parseFromPlainText(text, visibleISO) {
     if (!cur) return;
     if (cur.time && (cur.class_name || cur.status !== 'unknown')) {
       rows.push({
-        date: visibleISO,
+        date: iso,
         time: cur.time,
         class_name: cur.class_name || '',
         instructor: cur.instructor || '',
@@ -244,7 +219,8 @@ function parseFromPlainText(text, visibleISO) {
   }
 
   for (let i = 0; i < section.length; i++) {
-    const t = norm(section[i]);
+    const raw = section[i];
+    const t = norm(raw);
 
     const tm = t.match(TIME_RE);
     if (tm) {
@@ -255,7 +231,10 @@ function parseFromPlainText(text, visibleISO) {
     if (!cur) continue;
 
     const pm = t.match(PRICE_RE);
-    if (pm) { cur.price = parseFloat(pm[1]); cur.price_text = `$${pm[1]}`; }
+    if (pm) {
+      cur.price = parseFloat(pm[1]);
+      cur.price_text = `$${pm[1]}`;
+    }
 
     if (IGNORE.has(t)) continue;
     if (DROPIN_RE.test(t)) continue;
@@ -287,10 +266,10 @@ function parseFromPlainText(text, visibleISO) {
   return dedup;
 }
 
-// ---------- PNG capture ----------
+// ---------- PNG capture (optional) ----------
 app.get('/capture-schedule', async (req, res) => {
-  const startISO = clampISO(req.query.start);
-  const endISO   = clampISO(req.query.end);
+  const startISO = toISO(req.query.start);
+  const endISO   = toISO(req.query.end);
   const dpr      = Number(req.query.dpr || 2);
   const delayMs  = Number(req.query.delay || 1500);
   const fullPage = String(req.query.fullPage || '0') === '1';
@@ -324,18 +303,17 @@ app.get('/capture-schedule', async (req, res) => {
   }
 });
 
-// ---------- Text + structured rows (date-correct, with price) ----------
+// ---------- Text + structured rows (TEXT-FIRST + DOM fallback) ----------
 app.get('/capture-schedule-text', async (req, res) => {
-  const rawStart = req.query.start;
-  const rawEnd   = req.query.end;
-  const startISO = clampISO(rawStart);
-  const endISO   = clampISO(rawEnd);
+  const startISO = toISO(req.query.start);
+  const endISO   = toISO(req.query.end);
   const referer  = String(req.query.url || '');
   const debug    = String(req.query.debug || '0') === '1';
-  const delayMs  = Number(req.query.delay || 1800);
+  const delayMs  = Number(req.query.delay || 2000);
 
   try {
     const result = await withBrowser(async ({ page }) => {
+      // Load page or local shell
       if (referer) {
         await page.goto(referer, { waitUntil: 'domcontentloaded', timeout: 120000 });
         await page.waitForLoadState('load', { timeout: 15000 }).catch(() => {});
@@ -343,9 +321,10 @@ app.get('/capture-schedule-text', async (req, res) => {
         await page.setContent(LOCAL_HTML({ start: startISO, end: endISO }), { waitUntil: 'domcontentloaded', timeout: 60000 });
       }
 
+      // Find widget frame
       let frame = await getWallaFrameByScan(page, { timeoutMs: 45000 });
 
-      // Force URL params in iframe
+      // Force frame to start/end via URL
       try {
         await frame.evaluate(([isoStart, isoEnd]) => {
           try {
@@ -356,98 +335,126 @@ app.get('/capture-schedule-text', async (req, res) => {
           } catch {}
         }, [startISO, endISO]);
 
+        // give it a moment to reload and re-acquire the frame
         await page.waitForTimeout(1200);
         frame = await getWallaFrameByScan(page, { timeoutMs: 20000 });
+
+        // ensure the frame URL actually has the requested start date
+        await frame.waitForFunction((iso) => {
+          try { return new URL(location.href).searchParams.get('start') === iso; }
+          catch { return false; }
+        }, startISO, { timeout: 5000 }).catch(() => {});
       } catch {}
 
-      // Try UI navigation to the desired day
-      if (startISO) await ensureDay(frame, startISO).catch(()=>{});
+      // Try toggling to "Daily" + click the target day tab
+      await frame.evaluate((iso) => {
+        const d = new Date(iso + 'T12:00:00');
+        const dowShort = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][d.getUTCDay()];
+        const monShort = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][d.getUTCMonth()];
+        const day = d.getUTCDate();
+        const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
 
-      // Wait for content
+        const dailyBtn = Array.from(document.querySelectorAll('button,[role=tab],a,[role=button]'))
+          .find(el => /^daily$/i.test(norm(el.innerText || el.textContent || '')));
+        if (dailyBtn) dailyBtn.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+
+        const tabVariants = new Set([`${dowShort} ${monShort} ${day}`, `${monShort} ${day}`, `${dowShort} ${day}`]);
+        const tabs = Array.from(document.querySelectorAll('button,[role=tab],a,[role=button],.tab,.day'));
+        for (const el of tabs) {
+          const t = norm(el.innerText || el.textContent || '');
+          for (const v of tabVariants) {
+            if (t.includes(v)) {
+              el.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+              break;
+            }
+          }
+        }
+        window.scrollTo(0, 0);
+      }, startISO).catch(()=>{});
+
+      // Waits: layout + content present
       await frame.waitForTimeout(delayMs);
       await frame.waitForFunction(() => {
         const t = (document.body.innerText || '').trim();
         return /\b([0-1]?\d:[0-5]\d)\s*(AM|PM)\b/i.test(t) || /Book|Waitlist|Sold\s*Out|Full/i.test(t);
       }, { timeout: 20000 }).catch(()=>{});
 
-      const targetYear = yearFromISO(startISO);
-      let visibleISO = await extractVisibleDateISO(frame, targetYear);
-      if (!visibleISO) visibleISO = startISO || visibleISO;
-
-      const day_mismatch = !!(startISO && visibleISO && visibleISO !== startISO);
-
+      // Snapshot text for day-scoped parsing
       const text = await frame.evaluate(() => document.body.innerText || '').catch(() => '');
 
-      const parsedDom = await frame.evaluate((visibleISO) => {
-        const out = [];
-        const qAll = (sel, r = document) => Array.from(r.querySelectorAll(sel));
-        const txt  = (el) => (el?.innerText || '').trim();
+      // --- TEXT-FIRST ---
+      let parse_mode = 'text';
+      let parsed = parseFromPlainText(text, startISO);
 
-        const TIME_RE   = /\b([0-1]?\d:[0-5]\d)\s*([AP]M)\b/i;
-        const SPOTS_RE  = /\b(\d+)\s*SPOTS?\b/i;
-        const PRICE_RE  = /(?:Drop-?in:?\s*)?\$([0-9]+(?:\.[0-9]{2})?)/i;
-
-        const cands = qAll('[data-testid="class-row"], .class-row, .schedule-row, .class-item, li, tr, .row')
-          .filter(el => (el && (el.innerText || '').trim().length > 0));
-
-        for (const row of cands) {
-          const t = txt(row);
-          const tm = t.match(TIME_RE);
-          if (!tm) continue;
-          const time = `${tm[1]} ${tm[2].toUpperCase()}`;
-
-          let class_name = (row.querySelector('.class-title,[data-testid="class-name"],a,h3,h4,[role=heading]')?.innerText || '').trim();
-          if (!class_name) {
-            const parts = t.split('\n').map(s => s.trim()).filter(Boolean);
-            class_name = parts.find(p => !TIME_RE.test(p) && !/^Drop-?in:/i.test(p) && p.length > 2 && !/^EDT$/i.test(p)) || '';
-          }
-
-          let instructor = '';
-          const im = t.match(/w\/\s*([A-Za-z][A-Za-z .'-]+)/i);
-          if (im) instructor = im[1].trim();
-
-          const badges = qAll('span, div, button', row).map(e => (e.innerText || '').trim());
-          const spotsLabel = badges.find(s => SPOTS_RE.test(s));
-          const btnText    = badges.find(s => /book|waitlist|sold\s*out|full/i.test(s)) || '';
-
-          // price
-          let price = null, price_text = null;
-          const pRow = t.match(PRICE_RE);
-          if (pRow) { price = parseFloat(pRow[1]); price_text = `$${pRow[1]}`; }
-          if (price == null) {
-            const pBadge = badges.map(b => b.match(PRICE_RE)).find(Boolean);
-            if (pBadge) { price = parseFloat(pBadge[1]); price_text = `$${pBadge[1]}`; }
-          }
-
-          let open_spots = null; let status = 'unknown';
-          if (spotsLabel) { const m = spotsLabel.match(SPOTS_RE); open_spots = m ? parseInt(m[1], 10) : 0; status = open_spots > 0 ? 'open' : 'full'; }
-          if (/waitlist/i.test(btnText) || /waitlist/i.test(t)) { status = 'waitlist'; if (open_spots === null) open_spots = 0; }
-          else if (/sold\s*out|^full$/i.test(btnText)) { status = 'full'; if (open_spots === null) open_spots = 0; }
-          else if (/book/i.test(btnText) && open_spots === null) { status = 'open'; open_spots = null; }
-
-          out.push({ date: visibleISO, time, class_name, instructor, status, open_spots, price, price_text });
-        }
-
-        // Dedup
-        const seen = new Set(); const dedup = [];
-        for (const r of out) { const k = `${r.date}|${r.time}|${r.class_name}`; if (seen.has(k)) continue; seen.add(k); dedup.push(r); }
-        return dedup;
-      }, visibleISO).catch(() => []);
-
-      let parse_mode = 'global-dom';
-      let parsed = parsedDom;
+      // --- DOM fallback (global) if text empty ---
       if (!parsed || parsed.length === 0) {
-        parse_mode = 'text';
-        parsed = parseFromPlainText(text, visibleISO);
+        parse_mode = 'global-dom';
+        parsed = await frame.evaluate((iso) => {
+          const out = [];
+          const qAll = (sel, r = document) => Array.from(r.querySelectorAll(sel));
+          const txt  = (el) => (el?.innerText || '').trim();
+
+          const TIME_RE   = /\b([0-1]?\d:[0-5]\d)\s*([AP]M)\b/i;
+          const SPOTS_RE  = /\b(\d+)\s*SPOTS?\b/i;
+          const PRICE_RE  = /(?:Drop-?in:?\s*)?\$([0-9]+(?:\.[0-9]{2})?)/i;
+
+          const cands = qAll('[data-testid="class-row"], .class-row, .schedule-row, .class-item, li, tr, .row')
+            .filter(el => (el && (el.innerText || '').trim().length > 0));
+
+          for (const row of cands) {
+            const t = txt(row);
+            const tm = t.match(TIME_RE);
+            if (!tm) continue;
+            const time = `${tm[1]} ${tm[2].toUpperCase()}`;
+
+            let class_name = (row.querySelector('.class-title,[data-testid="class-name"],a,h3,h4,[role=heading]')?.innerText || '').trim();
+            if (!class_name) {
+              const parts = t.split('\n').map(s => s.trim()).filter(Boolean);
+              class_name = parts.find(p => !TIME_RE.test(p) && !/^Drop-?in:/i.test(p) && p.length > 2 && !/^EDT$/i.test(p)) || '';
+            }
+
+            let instructor = '';
+            const im = t.match(/w\/\s*([A-Za-z][A-Za-z .'-]+)/i);
+            if (im) instructor = im[1].trim();
+
+            const badges = qAll('span, div, button', row).map(e => (e.innerText || '').trim());
+            const spotsLabel = badges.find(s => SPOTS_RE.test(s));
+            const btnText    = badges.find(s => /book|waitlist|sold\s*out|full/i.test(s)) || '';
+
+            // price
+            let price = null, price_text = null;
+            const pRow = t.match(PRICE_RE);
+            if (pRow) { price = parseFloat(pRow[1]); price_text = `$${pRow[1]}`; }
+            if (price == null) {
+              const pBadge = badges.map(b => b.match(PRICE_RE)).find(Boolean);
+              if (pBadge) { price = parseFloat(pBadge[1]); price_text = `$${pBadge[1]}`; }
+            }
+
+            let open_spots = null; let status = 'unknown';
+            if (spotsLabel) { const m = spotsLabel.match(SPOTS_RE); open_spots = m ? parseInt(m[1], 10) : 0; status = open_spots > 0 ? 'open' : 'full'; }
+            if (/waitlist/i.test(btnText) || /waitlist/i.test(t)) { status = 'waitlist'; if (open_spots === null) open_spots = 0; }
+            else if (/sold\s*out|^full$/i.test(btnText)) { status = 'full'; if (open_spots === null) open_spots = 0; }
+            else if (/book/i.test(btnText) && open_spots === null) { status = 'open'; open_spots = null; }
+
+            out.push({ date: iso, time, class_name, instructor, status, open_spots, price, price_text });
+          }
+
+          // Dedup
+          const seen = new Set(); const dedup = [];
+          for (const r of out) { const k = `${r.date}|${r.time}|${r.class_name}`; if (seen.has(k)) continue; seen.add(k); dedup.push(r); }
+          return dedup;
+        }, startISO).catch(() => []);
       }
+
+      // Visible date + mismatch flag
+      const visibleISO = await extractVisibleDateISO(frame, (new Date().getFullYear())).catch(() => null);
+      const day_mismatch = !!(visibleISO && startISO && visibleISO !== startISO);
 
       return {
         parsed,
         parse_mode,
         visible_date_iso: visibleISO || null,
         day_mismatch,
-        _debug_rawStart: rawStart,
-        _debug_rawEnd: rawEnd,
         text: debug ? text : undefined,
         frames: debug ? page.frames().map(fr => fr.url()) : undefined
       };
@@ -458,11 +465,8 @@ app.get('/capture-schedule-text', async (req, res) => {
       end: endISO,
       parse_mode: result.parse_mode || null,
       visible_date_iso: result.visible_date_iso || null,
-      day_mismatch: !!result.day_mismatch,
+      day_mismatch: result.day_mismatch || false,
       parsed: result.parsed || [],
-      // Uncomment for troubleshooting:
-      // _debug_rawStart: result._debug_rawStart,
-      // _debug_rawEnd: result._debug_rawEnd,
       ...(debug ? { text: result.text || '', frames: result.frames || [] } : {}),
     });
   } catch (e) {
